@@ -1,0 +1,1388 @@
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
+} from "recharts";
+import {
+  LayoutDashboard, NotebookPen, CalendarDays, IndianRupee, Plus, Trash2, Pencil,
+  ChevronLeft, ChevronRight, X, Check, Phone, Users, Tag, Home, Upload, Download,
+} from "lucide-react";
+import { supabase, supabaseConfigured } from "./supabaseClient";
+
+const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');`;
+
+const INK = "#1E2A44";
+const INK_SOFT = "#2C3B5E";
+const PAPER = "#FAF6EE";
+const PAPER_DIM = "#F1EAD9";
+const MUSTARD = "#C98A1F";
+const MUSTARD_DEEP = "#A66E12";
+const LINE = "#E4DAC4";
+const TEXT_MUTED = "#6B7280";
+
+const DEFAULT_PROPERTIES = ["Whimsy Suite"];
+const PROPERTY_COLORS = ["#B6473F", "#2F6F8F", "#3F6B4E", "#8A5FA6", "#B8862E", "#4A6670"];
+const DIRECT_PAYMENT_MODES = ["UPI", "Cash", "Bank Transfer", "Card", "Other"];
+const SOURCES = ["Airbnb", "Direct", "Referral", "Other"];
+
+function propertyColor(properties, name) {
+  const idx = properties.indexOf(name);
+  return PROPERTY_COLORS[idx >= 0 ? idx % PROPERTY_COLORS.length : 0];
+}
+// Handles the current shape (guest-paid vs. host-payout split for Airbnb, plus a direct amount),
+// and falls back gracefully for records saved before that split existed.
+function paymentBreakdown(b) {
+  if (b.guestPaidAirbnb !== undefined || b.airbnbPayout !== undefined) {
+    return {
+      guestPaidAirbnb: Number(b.guestPaidAirbnb) || 0,
+      airbnbPayout: Number(b.airbnbPayout) || 0,
+      direct: Number(b.amountDirect) || 0,
+      directMode: b.directMode || "UPI",
+    };
+  }
+  if (b.amountAirbnb !== undefined || b.amountDirect !== undefined) {
+    const amt = Number(b.amountAirbnb) || 0;
+    return { guestPaidAirbnb: amt, airbnbPayout: amt, direct: Number(b.amountDirect) || 0, directMode: b.directMode || "UPI" };
+  }
+  const amt = Number(b.amountPaid) || 0;
+  if (b.paymentMode === "Airbnb Payout") return { guestPaidAirbnb: amt, airbnbPayout: amt, direct: 0, directMode: "UPI" };
+  return { guestPaidAirbnb: 0, airbnbPayout: 0, direct: amt, directMode: b.paymentMode || "UPI" };
+}
+// What the guest has paid in total so far (drives balance-due tracking).
+function guestPaidTotal(b) {
+  const { guestPaidAirbnb, direct } = paymentBreakdown(b);
+  return guestPaidAirbnb + direct;
+}
+// What actually lands in the host's pocket — Airbnb payout (post fees/taxes) plus direct payments.
+function hostEarnings(b) {
+  const { airbnbPayout, direct } = paymentBreakdown(b);
+  return airbnbPayout + direct;
+}
+function inr(n) {
+  const v = Number(n) || 0;
+  return "₹" + v.toLocaleString("en-IN");
+}
+function pad2(n) { return String(n).padStart(2, "0"); }
+// Builds a YYYY-MM-DD string from local date parts — never round-trips through toISOString(),
+// which renders in UTC and silently shifts the date back a day for timezones ahead of UTC
+// (e.g. India, UTC+5:30). That mismatch was making guests appear on the wrong calendar cell.
+function ymdToISO(year, month0, day) { return `${year}-${pad2(month0 + 1)}-${pad2(day)}`; }
+function todayStr() {
+  const d = new Date();
+  return ymdToISO(d.getFullYear(), d.getMonth(), d.getDate());
+}
+function addDays(dateStr, n) {
+  const d = new Date(dateStr + "T00:00:00");
+  d.setDate(d.getDate() + n);
+  return ymdToISO(d.getFullYear(), d.getMonth(), d.getDate());
+}
+function daysBetween(a, b) {
+  return Math.round((new Date(b) - new Date(a)) / 86400000);
+}
+// Walks every night of a stay and buckets it by the calendar month it falls in, so a booking
+// that spans a month boundary (e.g. checks in Aug 30, checks out Sep 3) can have its revenue
+// split proportionally rather than dumped entirely into the check-in month.
+function nightsByMonth(checkIn, checkOut) {
+  const result = {};
+  if (!checkIn || !checkOut) return result;
+  let cur = new Date(checkIn + "T00:00:00");
+  const end = new Date(checkOut + "T00:00:00");
+  let guard = 0;
+  while (cur < end && guard < 730) {
+    const key = `${cur.getFullYear()}-${cur.getMonth()}`;
+    result[key] = (result[key] || 0) + 1;
+    cur.setDate(cur.getDate() + 1);
+    guard++;
+  }
+  return result;
+}
+function monthLabel(d) {
+  return d.toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+}
+function emptyForm() {
+  return {
+    id: null, guest: "", phone: "", property: "", checkIn: todayStr(),
+    checkOut: addDays(todayStr(), 1), guests: 1, totalAmount: "",
+    guestPaidAirbnb: "", airbnbPayout: "", amountDirect: "", directMode: "UPI",
+    source: "Airbnb", enteredBy: "", notes: "", cancelled: false,
+  };
+}
+
+function toISODate(mmddyyyy) {
+  const parts = (mmddyyyy || "").trim().split("/");
+  if (parts.length !== 3) return "";
+  const [mm, dd, yyyy] = parts;
+  return `${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}`;
+}
+function parseCSVLine(line) {
+  const out = [];
+  let cur = "", inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else inQuotes = false;
+      } else cur += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ",") { out.push(cur); cur = ""; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+// Parses Airbnb's "All-time" transaction/earnings CSV export. Reservation rows show the
+// pre-fee amount; Tax Withholding / adjustment rows for the same Confirmation Code adjust it
+// down to the real payout, so amounts are summed per Confirmation Code rather than read off
+// a single row.
+function parseAirbnbCSV(text, existingProperties) {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 2) return { bookings: [], newProperties: [] };
+  const header = parseCSVLine(lines[0]).map((h) => h.trim());
+  const idx = (name) => header.indexOf(name);
+  const iType = idx("Type"), iConf = idx("Confirmation Code"), iStart = idx("Start date"),
+    iEnd = idx("End date"), iGuest = idx("Guest"), iListing = idx("Listing"),
+    iAmount = idx("Amount"), iGross = idx("Gross earnings");
+
+  const byCode = {};
+  for (let i = 1; i < lines.length; i++) {
+    const row = parseCSVLine(lines[i]);
+    const type = row[iType] || "";
+    const code = (row[iConf] || "").trim();
+    if (!code || type === "Payout") continue;
+    if (!byCode[code]) {
+      byCode[code] = {
+        code, guest: row[iGuest] || "", listing: row[iListing] || "",
+        startDate: row[iStart] || "", endDate: row[iEnd] || "", gross: 0, amountSum: 0,
+      };
+    }
+    const entry = byCode[code];
+    const gross = parseFloat(row[iGross]);
+    if (!isNaN(gross) && gross !== 0) entry.gross = gross;
+    const amt = parseFloat(row[iAmount]);
+    if (!isNaN(amt)) entry.amountSum += amt;
+    if (row[iStart]) entry.startDate = entry.startDate || row[iStart];
+    if (row[iEnd]) entry.endDate = entry.endDate || row[iEnd];
+  }
+
+  const newProperties = [];
+  const bookings = Object.values(byCode).map((e) => {
+    let property = existingProperties.find((p) => e.listing.includes(p));
+    if (!property) {
+      property = (e.listing.split("|")[0] || e.listing).trim();
+      if (property && !existingProperties.includes(property) && !newProperties.includes(property)) {
+        newProperties.push(property);
+      }
+    }
+    const guestPaidAirbnb = e.gross || Math.max(0, e.amountSum);
+    const airbnbPayout = Math.max(0, e.amountSum);
+    return {
+      ...emptyForm(),
+      id: "import-" + e.code,
+      importRef: e.code,
+      guest: e.guest,
+      property,
+      checkIn: toISODate(e.startDate),
+      checkOut: toISODate(e.endDate),
+      totalAmount: guestPaidAirbnb || "",
+      guestPaidAirbnb: guestPaidAirbnb || "",
+      airbnbPayout: airbnbPayout || "",
+      amountDirect: "",
+      source: "Airbnb",
+      notes: `Imported from Airbnb (confirmation ${e.code})`,
+    };
+  }).filter((b) => b.guest && b.checkIn);
+
+  return { bookings, newProperties };
+}
+
+// Parses Stay Ledger's own "Download backup CSV" format (not Airbnb's) — used to merge data
+// captured on one device/session into another. Matches existing records by guest+property+dates
+// and updates them in place; anything not matched is added as new. Nothing is ever deleted by
+// this — if a booking's missing from the file, it's left alone.
+function parseBackupCSV(text) {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length < 2) return [];
+  const header = parseCSVLine(lines[0]).map((h) => h.trim());
+  const idx = (name) => header.indexOf(name);
+  const cols = {
+    guest: idx("Guest Name"), phone: idx("Phone"), property: idx("Property"),
+    checkIn: idx("Check-in"), checkOut: idx("Check-out"), guests: idx("Guests"),
+    totalAmount: idx("Total Amount"), guestPaidAirbnb: idx("Guest Paid via Airbnb"),
+    airbnbPayout: idx("Your Airbnb Payout"), amountDirect: idx("Paid Directly"),
+    directMode: idx("Direct Payment Mode"), source: idx("Source"), enteredBy: idx("Entered By"),
+    notes: idx("Notes"), cancelled: idx("Cancelled"),
+  };
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const row = parseCSVLine(lines[i]);
+    if (!row[cols.guest]) continue;
+    rows.push({
+      ...emptyForm(),
+      guest: row[cols.guest] || "",
+      phone: row[cols.phone] || "",
+      property: row[cols.property] || "",
+      checkIn: row[cols.checkIn] || "",
+      checkOut: row[cols.checkOut] || "",
+      guests: row[cols.guests] || "",
+      totalAmount: row[cols.totalAmount] || "",
+      guestPaidAirbnb: row[cols.guestPaidAirbnb] || "",
+      airbnbPayout: row[cols.airbnbPayout] || "",
+      amountDirect: row[cols.amountDirect] || "",
+      directMode: row[cols.directMode] || "UPI",
+      source: row[cols.source] || "Other",
+      enteredBy: row[cols.enteredBy] || "",
+      notes: row[cols.notes] || "",
+      cancelled: (row[cols.cancelled] || "").trim().toUpperCase() === "Y",
+    });
+  }
+  return rows;
+}
+function bookingNaturalKey(b) {
+  return `${(b.guest || "").trim().toLowerCase()}|${(b.property || "").trim().toLowerCase()}|${b.checkIn}|${b.checkOut}`;
+}
+
+// --- Supabase row <-> app-shape mapping ---------------------------------------------------
+// The app's fields are camelCase; Postgres columns are snake_case. These two functions are the
+// only place that boundary is crossed, so every other component keeps working unmodified.
+function rowToBooking(r) {
+  return {
+    id: r.id,
+    importRef: r.import_ref || null,
+    guest: r.guest || "",
+    phone: r.phone || "",
+    property: r.property || "",
+    checkIn: r.check_in || "",
+    checkOut: r.check_out || "",
+    guests: r.guests ?? "",
+    totalAmount: r.total_amount ?? "",
+    guestPaidAirbnb: r.guest_paid_airbnb ?? "",
+    airbnbPayout: r.airbnb_payout ?? "",
+    amountDirect: r.amount_direct ?? "",
+    directMode: r.direct_mode || "UPI",
+    source: r.source || "Airbnb",
+    enteredBy: r.entered_by || "",
+    notes: r.notes || "",
+    cancelled: !!r.cancelled,
+  };
+}
+function bookingToRow(b) {
+  const num = (v) => (v === "" || v === undefined || v === null ? null : Number(v));
+  return {
+    id: b.id,
+    import_ref: b.importRef || null,
+    guest: b.guest || "",
+    phone: b.phone || "",
+    property: b.property || "",
+    check_in: b.checkIn || null,
+    check_out: b.checkOut || null,
+    guests: num(b.guests),
+    total_amount: num(b.totalAmount),
+    guest_paid_airbnb: num(b.guestPaidAirbnb),
+    airbnb_payout: num(b.airbnbPayout),
+    amount_direct: num(b.amountDirect),
+    direct_mode: b.directMode || null,
+    source: b.source || null,
+    entered_by: b.enteredBy || null,
+    notes: b.notes || null,
+    cancelled: !!b.cancelled,
+  };
+}
+
+function useStorage() {
+  const [bookings, setBookings] = useState([]);
+  const [properties, setProperties] = useState(DEFAULT_PROPERTIES);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data: bRows, error: bErr } = await supabase
+          .from("bookings").select("*").order("check_in", { ascending: false });
+        if (bErr) throw bErr;
+        const { data: pRows, error: pErr } = await supabase
+          .from("properties").select("*").order("name");
+        if (pErr) throw pErr;
+
+        setBookings((bRows || []).map(rowToBooking));
+        setProperties((pRows || []).length ? pRows.map((r) => r.name) : DEFAULT_PROPERTIES);
+      } catch (e) {
+        console.error(e);
+        setError("Could not load saved data — check your Supabase connection.");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  // Accepts the *next full array* (matching how every call site already works) and diffs it
+  // against current state to issue the minimal set of upserts/deletes against Postgres.
+  const persistBookings = useCallback(async (next) => {
+    const prevIds = new Set(bookings.map((b) => b.id));
+    const nextIds = new Set(next.map((b) => b.id));
+    const removedIds = [...prevIds].filter((id) => !nextIds.has(id));
+    setBookings(next);
+    try {
+      if (next.length) {
+        const rows = next.map(bookingToRow);
+        const { error: upErr } = await supabase.from("bookings").upsert(rows, { onConflict: "id" });
+        if (upErr) throw upErr;
+      }
+      if (removedIds.length) {
+        const { error: delErr } = await supabase.from("bookings").delete().in("id", removedIds);
+        if (delErr) throw delErr;
+      }
+      setError("");
+    } catch (e) {
+      console.error(e);
+      setError("Save failed — changes may not persist. Check your Supabase connection.");
+    }
+  }, [bookings]);
+
+  const persistProperties = useCallback(async (next) => {
+    const prevSet = new Set(properties);
+    const nextSet = new Set(next);
+    const added = next.filter((p) => !prevSet.has(p));
+    const removed = properties.filter((p) => !nextSet.has(p));
+    setProperties(next);
+    try {
+      if (added.length) {
+        const { error: upErr } = await supabase.from("properties").upsert(added.map((name) => ({ name })), { onConflict: "name" });
+        if (upErr) throw upErr;
+      }
+      if (removed.length) {
+        const { error: delErr } = await supabase.from("properties").delete().in("name", removed);
+        if (delErr) throw delErr;
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }, [properties]);
+
+  return { bookings, properties, loading, error, persistBookings, persistProperties };
+}
+
+export default function App() {
+  if (!supabaseConfigured) {
+    return (
+      <div style={{
+        fontFamily: "system-ui, sans-serif", minHeight: "100vh", background: "#FAF6EE",
+        display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+      }}>
+        <div style={{ maxWidth: 480, background: "#fff", border: "1px solid #E4DAC4", borderRadius: 10, padding: 28 }}>
+          <div style={{ fontSize: 20, fontWeight: 700, marginBottom: 10, color: "#1E2A44" }}>Database not connected</div>
+          <div style={{ fontSize: 14, color: "#333", lineHeight: 1.6 }}>
+            Spare Key can't reach Supabase — <code>VITE_SUPABASE_URL</code> or <code>VITE_SUPABASE_ANON_KEY</code> is
+            missing or invalid in this build.
+            <br /><br />
+            If you deployed by dragging the <code>dist</code> folder onto Netlify (Netlify Drop): environment
+            variables added in Netlify's dashboard only apply to builds Netlify itself runs — they don't reach a
+            folder you built locally and dropped in. Create a <code>.env</code> file with real values
+            (see <code>.env.example</code>), run <code>npm run build</code> again, and drag the new{" "}
+            <code>dist</code> folder onto Netlify to replace this deploy.
+          </div>
+        </div>
+      </div>
+    );
+  }
+  return <AppShell />;
+}
+
+function AppShell() {
+  const { bookings, properties, loading, error, persistBookings, persistProperties } = useStorage();
+  const [tab, setTab] = useState("dashboard");
+  const [navOpen, setNavOpen] = useState(false);
+
+  const NAV = [
+    { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+    { id: "bookings", label: "Bookings", icon: NotebookPen },
+    { id: "calendar", label: "Calendar", icon: CalendarDays },
+    { id: "revenue", label: "Revenue", icon: IndianRupee },
+  ];
+
+  return (
+    <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", background: PAPER, minHeight: "100vh", color: INK }}>
+      <style>{FONT_IMPORT}{`
+        * { box-sizing: border-box; }
+        input, select, textarea, button { font-family: 'IBM Plex Sans', sans-serif; }
+        input:focus, select:focus, textarea:focus { outline: 2px solid ${MUSTARD}; outline-offset: 1px; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-thumb { background: ${LINE}; border-radius: 4px; }
+      `}</style>
+
+      <div style={{ display: "flex", minHeight: "100vh" }}>
+        {/* Sidebar */}
+        {navOpen && (
+          <div onClick={() => setNavOpen(false)} className="topbar-mobile" style={{
+            position: "fixed", inset: 0, background: "rgba(0,0,0,0.35)", zIndex: 35,
+          }} />
+        )}
+        <div style={{
+          width: 220, background: INK, color: PAPER, flexShrink: 0,
+          display: navOpen ? "flex" : "none", flexDirection: "column",
+          position: "fixed", top: 0, bottom: 0, left: 0, zIndex: 40,
+        }} className="sidebar-desktop">
+          <SidebarContent tab={tab} setTab={(t) => { setTab(t); setNavOpen(false); }} nav={NAV} />
+        </div>
+
+        <style>{`
+          @media (min-width: 860px) {
+            .sidebar-desktop { display: flex !important; }
+            .topbar-mobile { display: none !important; }
+            .main-content { margin-left: 220px; }
+          }
+        `}</style>
+
+        {/* Mobile topbar */}
+        <div className="topbar-mobile" style={{
+          position: "fixed", top: 0, left: 0, right: 0, height: 56, background: INK, color: PAPER,
+          display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 16px", zIndex: 30,
+        }}>
+          <span style={{ fontFamily: "'Fraunces', serif", fontSize: 20, fontWeight: 600 }}>Spare Key</span>
+          <button onClick={() => setNavOpen(!navOpen)} style={{
+            background: "none", border: "none", color: PAPER, fontSize: 14, cursor: "pointer",
+          }}>{navOpen ? "Close" : "Menu"}</button>
+        </div>
+
+        <div className="main-content" style={{ flex: 1, padding: "24px 24px 64px", marginTop: 56 }}>
+          <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+            {error && (
+              <div style={{ background: "#F6DEDE", color: "#8A2E2E", padding: "10px 14px", borderRadius: 6, marginBottom: 16, fontSize: 14 }}>
+                {error}
+              </div>
+            )}
+            {loading ? (
+              <div style={{ color: TEXT_MUTED, padding: 40, textAlign: "center" }}>Loading your bookings…</div>
+            ) : (
+              <>
+                {tab === "dashboard" && <Dashboard bookings={bookings} properties={properties} setTab={setTab} />}
+                {tab === "bookings" && (
+                  <BookingsTab
+                    bookings={bookings} properties={properties}
+                    persistBookings={persistBookings} persistProperties={persistProperties}
+                  />
+                )}
+                {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} />}
+                {tab === "revenue" && <RevenueTab bookings={bookings} properties={properties} />}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+function SidebarContent({ tab, setTab, nav }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "28px 0" }}>
+      <div style={{ padding: "0 24px 28px", borderBottom: `1px solid ${INK_SOFT}` }}>
+        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 24, fontWeight: 600, lineHeight: 1.1 }}>Spare Key</div>
+        <div style={{ fontSize: 12.5, color: "#AEB8CC", marginTop: 4 }}>Whimsy Suite, Jaipur</div>
+      </div>
+      <div style={{ padding: "16px 12px", display: "flex", flexDirection: "column", gap: 2, flex: 1 }}>
+        {nav.map(({ id, label, icon: Icon }) => (
+          <button key={id} onClick={() => setTab(id)} style={{
+            display: "flex", alignItems: "center", gap: 12, padding: "11px 14px", borderRadius: 8,
+            background: tab === id ? MUSTARD : "transparent", color: tab === id ? INK : PAPER,
+            border: "none", cursor: "pointer", fontSize: 14.5, fontWeight: tab === id ? 600 : 500,
+            textAlign: "left", width: "100%", transition: "background 0.15s",
+          }}>
+            <Icon size={17} /> {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub, accent }) {
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: "18px 20px", flex: 1, minWidth: 160 }}>
+      <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 28, fontWeight: 600, color: accent || INK }}>{value}</div>
+      {sub && <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function Dashboard({ bookings, properties, setTab }) {
+  const active = bookings.filter((b) => !b.cancelled);
+  const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
+  const totalOutstanding = active.reduce((s, b) => s + Math.max(0, (Number(b.totalAmount) || 0) - guestPaidTotal(b)), 0);
+  const today = todayStr();
+  const in3 = addDays(today, 3);
+
+  const checkoutsSoon = active
+    .filter((b) => b.checkOut >= today && b.checkOut <= in3)
+    .sort((a, b) => a.checkOut.localeCompare(b.checkOut));
+  const checkinsSoon = active
+    .filter((b) => b.checkIn >= today && b.checkIn <= in3)
+    .sort((a, b) => a.checkIn.localeCompare(b.checkIn));
+
+  const byProperty = properties.map((p) => ({
+    property: p,
+    revenue: active.filter((b) => b.property === p).reduce((s, b) => s + hostEarnings(b), 0),
+  }));
+  const maxRev = Math.max(1, ...byProperty.map((p) => p.revenue));
+
+  const airbnbFeesLost = active.reduce((s, b) => {
+    const { guestPaidAirbnb, airbnbPayout } = paymentBreakdown(b);
+    return s + Math.max(0, guestPaidAirbnb - airbnbPayout);
+  }, 0);
+
+  return (
+    <div>
+      <SectionHeader title="Dashboard" subtitle="Revenue and stays across every property, in one place." />
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 24 }}>
+        <StatCard label="Total revenue collected" value={inr(totalRevenue)} accent={MUSTARD_DEEP} sub="what you actually received" />
+        <StatCard label="Airbnb fees & taxes" value={inr(airbnbFeesLost)} sub="difference between guest paid and your payout" />
+        <StatCard label="Outstanding balance" value={inr(totalOutstanding)} sub={totalOutstanding > 0 ? "across pending bookings" : "all settled"} />
+        <StatCard label="Bookings on record" value={active.length} />
+      </div>
+
+      <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 320px" }}>
+          <PanelHeader>Checking out in the next 3 days</PanelHeader>
+          {checkoutsSoon.length === 0 ? (
+            <EmptyNote text="No checkouts due in the next 3 days." />
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {checkoutsSoon.map((b) => (
+                <GuestRow key={b.id} b={b} dateField="checkOut" properties={properties} />
+              ))}
+            </div>
+          )}
+        </div>
+        <div style={{ flex: "1 1 320px" }}>
+          <PanelHeader>Checking in in the next 3 days</PanelHeader>
+          {checkinsSoon.length === 0 ? (
+            <EmptyNote text="No check-ins due in the next 3 days." />
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {checkinsSoon.map((b) => (
+                <GuestRow key={b.id} b={b} dateField="checkIn" properties={properties} />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 28 }}>
+        <PanelHeader>Revenue by property</PanelHeader>
+        <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
+          {byProperty.map((p) => (
+            <div key={p.property} style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ width: 130, fontSize: 13.5, flexShrink: 0 }}>{p.property}</div>
+              <div style={{ flex: 1, background: PAPER_DIM, borderRadius: 4, height: 14, position: "relative" }}>
+                <div style={{
+                  width: `${(p.revenue / maxRev) * 100}%`, background: propertyColor(properties, p.property),
+                  height: "100%", borderRadius: 4, minWidth: p.revenue > 0 ? 4 : 0,
+                }} />
+              </div>
+              <div style={{ width: 100, fontSize: 13.5, textAlign: "right", fontWeight: 500 }}>{inr(p.revenue)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <button onClick={() => setTab("bookings")} style={{
+        marginTop: 24, background: MUSTARD, color: INK, border: "none", padding: "11px 20px",
+        borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer", display: "inline-flex",
+        alignItems: "center", gap: 8,
+      }}>
+        <Plus size={16} /> Log a new booking
+      </button>
+    </div>
+  );
+}
+
+function GuestRow({ b, dateField, properties }) {
+  return (
+    <div style={{
+      background: "#fff", border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px",
+      display: "flex", alignItems: "center", gap: 10,
+    }}>
+      <div style={{ width: 8, height: 8, borderRadius: "50%", background: propertyColor(properties, b.property), flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 14, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{b.guest}</div>
+        <div style={{ fontSize: 12, color: TEXT_MUTED }}>{b.property}</div>
+      </div>
+      <div style={{ fontSize: 13, fontWeight: 500, color: INK_SOFT, flexShrink: 0 }}>
+        {new Date(b[dateField] + "T00:00:00").toLocaleDateString("en-IN", { day: "numeric", month: "short" })}
+      </div>
+    </div>
+  );
+}
+
+function SectionHeader({ title, subtitle }) {
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 30, fontWeight: 600 }}>{title}</div>
+      {subtitle && <div style={{ fontSize: 14, color: TEXT_MUTED, marginTop: 4 }}>{subtitle}</div>}
+    </div>
+  );
+}
+function PanelHeader({ children }) {
+  return <div style={{ fontSize: 13.5, fontWeight: 600, color: INK_SOFT, marginBottom: 10, textTransform: "none" }}>{children}</div>;
+}
+function EmptyNote({ text }) {
+  return (
+    <div style={{ background: PAPER_DIM, border: `1px dashed ${LINE}`, borderRadius: 8, padding: "16px", color: TEXT_MUTED, fontSize: 13.5 }}>
+      {text}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+      <label style={{ fontSize: 12.5, color: TEXT_MUTED, fontWeight: 500 }}>{label}</label>
+      {children}
+    </div>
+  );
+}
+const inputStyle = {
+  border: `1px solid ${LINE}`, borderRadius: 7, padding: "9px 11px", fontSize: 14, background: "#fff", color: INK, width: "100%",
+};
+
+// Builds a Google-Sheets-importable CSV snapshot of every booking, and triggers a browser download.
+// This is a manual backup step — Claude artifacts can't reach external services like Google Sheets
+// directly, since the sandbox they run in blocks outbound network calls.
+function downloadBackupCSV(bookings) {
+  const cols = [
+    "Guest Name", "Phone", "Property", "Check-in", "Check-out", "Guests", "Total Amount",
+    "Guest Paid via Airbnb", "Your Airbnb Payout", "Paid Directly", "Direct Payment Mode",
+    "Source", "Entered By", "Notes", "Cancelled",
+  ];
+  const esc = (v) => {
+    const s = v === undefined || v === null ? "" : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const rows = bookings.map((b) => {
+    const { guestPaidAirbnb, airbnbPayout, direct, directMode } = paymentBreakdown(b);
+    return [
+      b.guest, b.phone, b.property, b.checkIn, b.checkOut, b.guests, b.totalAmount,
+      guestPaidAirbnb || "", airbnbPayout || "", direct || "", direct ? directMode : "",
+      b.source, b.enteredBy, b.notes, b.cancelled ? "Y" : "N",
+    ].map(esc).join(",");
+  });
+  const csv = [cols.join(","), ...rows].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `spare-key-backup-${todayStr()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function BookingsTab({ bookings, properties, persistBookings, persistProperties }) {
+  const [form, setForm] = useState(emptyForm());
+  const [showForm, setShowForm] = useState(false);
+  const [newProperty, setNewProperty] = useState("");
+  const [filterProperty, setFilterProperty] = useState("All");
+  const [query, setQuery] = useState("");
+  const [showImport, setShowImport] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importPreview, setImportPreview] = useState(null);
+  const [importError, setImportError] = useState("");
+  const [showRestore, setShowRestore] = useState(false);
+  const [restoreText, setRestoreText] = useState("");
+  const [restorePreview, setRestorePreview] = useState(null);
+  const [restoreError, setRestoreError] = useState("");
+  const [formError, setFormError] = useState("");
+  const formRef = useRef(null);
+
+  useEffect(() => {
+    if (!form.property && properties.length) setForm((f) => ({ ...f, property: properties[0] }));
+  }, [properties]); // eslint-disable-line
+
+  // The form renders above the bookings list — on a long list, opening it (especially for Edit,
+  // triggered from a card further down) can land off-screen and look like the button did nothing.
+  useEffect(() => {
+    if (showForm && formRef.current) {
+      formRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [showForm]);
+
+  const resetForm = () => { setForm(emptyForm()); setShowForm(false); setFormError(""); };
+
+  const submit = (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!form.guest.trim()) return setFormError("Guest name is required.");
+    if (!form.property) return setFormError("Property is required.");
+    if (!form.checkIn) return setFormError("Check-in date is required.");
+    if (!form.checkOut) return setFormError("Check-out date is required.");
+    setFormError("");
+    const record = { ...form, id: form.id || (Date.now() + "-" + Math.random().toString(36).slice(2)) };
+    let next;
+    if (form.id) {
+      next = bookings.map((b) => (b.id === form.id ? record : b));
+    } else {
+      next = [...bookings, record];
+    }
+    persistBookings(next);
+    resetForm();
+  };
+
+  const editBooking = (b) => { setForm(b); setShowForm(true); setFormError(""); };
+  const deleteBooking = (id, guest) => {
+    if (!window.confirm(`Delete the booking for ${guest || "this guest"}? This can't be undone.`)) return;
+    persistBookings(bookings.filter((b) => b.id !== id));
+  };
+  const addProperty = () => {
+    const name = newProperty.trim();
+    if (!name || properties.includes(name)) return;
+    persistProperties([...properties, name]);
+    setNewProperty("");
+  };
+
+  const handleFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setImportText(String(reader.result || ""));
+    reader.readAsText(file);
+  };
+
+  const runImportParse = () => {
+    setImportError("");
+    try {
+      const { bookings: parsed, newProperties } = parseAirbnbCSV(importText, properties);
+      if (parsed.length === 0) {
+        setImportError("Couldn't find any reservation rows in that file — make sure it's the Airbnb transaction/earnings CSV export.");
+        setImportPreview(null);
+        return;
+      }
+      const existingRefs = new Set(bookings.map((b) => b.importRef).filter(Boolean));
+      const fresh = parsed.filter((b) => !existingRefs.has(b.importRef));
+      const dupes = parsed.length - fresh.length;
+      setImportPreview({ fresh, dupes, newProperties });
+    } catch (err) {
+      setImportError("Couldn't read that file — check it's a CSV export from Airbnb.");
+      setImportPreview(null);
+    }
+  };
+
+  const confirmImport = () => {
+    if (!importPreview) return;
+    if (importPreview.newProperties.length) {
+      persistProperties([...properties, ...importPreview.newProperties]);
+    }
+    persistBookings([...bookings, ...importPreview.fresh]);
+    setShowImport(false); setImportText(""); setImportPreview(null); setImportError("");
+  };
+
+  const handleRestoreFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setRestoreText(String(reader.result || ""));
+    reader.readAsText(file);
+  };
+
+  const runRestoreParse = () => {
+    setRestoreError("");
+    try {
+      const parsed = parseBackupCSV(restoreText);
+      if (parsed.length === 0) {
+        setRestoreError("Couldn't find any bookings in that file — make sure it's a Stay Ledger backup CSV (from \"Download backup CSV\").");
+        setRestorePreview(null);
+        return;
+      }
+      const existingByKey = {};
+      bookings.forEach((b) => { existingByKey[bookingNaturalKey(b)] = b; });
+      const toUpdate = [], toAdd = [];
+      parsed.forEach((row) => {
+        const key = bookingNaturalKey(row);
+        const match = existingByKey[key];
+        if (match) toUpdate.push({ ...row, id: match.id, importRef: match.importRef });
+        else toAdd.push({ ...row, id: Date.now() + "-" + Math.random().toString(36).slice(2) });
+      });
+      setRestorePreview({ toUpdate, toAdd });
+    } catch (err) {
+      setRestoreError("Couldn't read that file — make sure it's a Stay Ledger backup CSV.");
+      setRestorePreview(null);
+    }
+  };
+
+  const confirmRestore = () => {
+    if (!restorePreview) return;
+    const updateIds = new Set(restorePreview.toUpdate.map((b) => b.id));
+    const merged = bookings.map((b) => updateIds.has(b.id) ? restorePreview.toUpdate.find((u) => u.id === b.id) : b);
+    persistBookings([...merged, ...restorePreview.toAdd]);
+    setShowRestore(false); setRestoreText(""); setRestorePreview(null); setRestoreError("");
+  };
+
+  const filtered = bookings
+    .filter((b) => filterProperty === "All" || b.property === filterProperty)
+    .filter((b) => !query.trim() || b.guest.toLowerCase().includes(query.toLowerCase()))
+    .sort((a, b) => b.checkIn.localeCompare(a.checkIn));
+
+  return (
+    <div>
+      <SectionHeader title="Bookings" subtitle="Add, edit, and review every stay." />
+
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 18, alignItems: "center" }}>
+        <button onClick={() => { setForm(emptyForm()); setShowForm(true); setFormError(""); }} style={{
+          background: MUSTARD, color: INK, border: "none", padding: "10px 18px", borderRadius: 8,
+          fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8,
+        }}>
+          <Plus size={16} /> New booking
+        </button>
+        <button onClick={() => setShowImport(true)} style={{
+          background: "#fff", color: INK, border: `1px solid ${LINE}`, padding: "10px 16px", borderRadius: 8,
+          fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8,
+        }}>
+          <Upload size={16} /> Import from Airbnb CSV
+        </button>
+        <button onClick={() => setShowRestore(true)} style={{
+          background: "#fff", color: INK, border: `1px solid ${LINE}`, padding: "10px 16px", borderRadius: 8,
+          fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8,
+        }}>
+          <Upload size={16} /> Restore from backup
+        </button>
+        <button onClick={() => downloadBackupCSV(bookings)} disabled={bookings.length === 0} style={{
+          background: "#fff", color: bookings.length ? INK : TEXT_MUTED, border: `1px solid ${LINE}`, padding: "10px 16px", borderRadius: 8,
+          fontSize: 14, fontWeight: 600, cursor: bookings.length ? "pointer" : "default", display: "flex", alignItems: "center", gap: 8,
+        }}>
+          <Download size={16} /> Download backup CSV
+        </button>
+        <input placeholder="Search guest…" value={query} onChange={(e) => setQuery(e.target.value)}
+          style={{ ...inputStyle, width: 180 }} />
+        <select value={filterProperty} onChange={(e) => setFilterProperty(e.target.value)} style={{ ...inputStyle, width: 170 }}>
+          <option>All</option>
+          {properties.map((p) => <option key={p}>{p}</option>)}
+        </select>
+        <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
+          <input placeholder="Add property…" value={newProperty} onChange={(e) => setNewProperty(e.target.value)}
+            style={{ ...inputStyle, width: 140 }} />
+          <button onClick={addProperty} style={{
+            background: "#fff", border: `1px solid ${LINE}`, borderRadius: 7, padding: "0 12px", cursor: "pointer", fontSize: 13,
+          }}>Add</button>
+        </div>
+      </div>
+
+      {showImport && (
+        <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 22 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600 }}>Import from Airbnb CSV</div>
+            <button type="button" onClick={() => { setShowImport(false); setImportPreview(null); setImportText(""); setImportError(""); }}
+              style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}>
+              <X size={18} />
+            </button>
+          </div>
+          <div style={{ fontSize: 13, color: TEXT_MUTED, marginBottom: 12 }}>
+            Upload the CSV you export from your Airbnb transaction history (Insights → Earnings → Export). It's read in your browser and never leaves this device except into your shared booking data.
+          </div>
+          <input type="file" accept=".csv,text/csv" onChange={handleFile} style={{ marginBottom: 10, fontSize: 13 }} />
+          <div style={{ fontSize: 12, color: TEXT_MUTED, marginBottom: 6 }}>or paste the CSV contents:</div>
+          <textarea value={importText} onChange={(e) => setImportText(e.target.value)} placeholder="Date,Arriving by date,Type,Confirmation Code,..."
+            style={{ ...inputStyle, minHeight: 90, fontFamily: "monospace", fontSize: 11.5, resize: "vertical" }} />
+          {importError && <div style={{ color: "#B6473F", fontSize: 13, marginTop: 8 }}>{importError}</div>}
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button onClick={runImportParse} disabled={!importText.trim()} style={{
+              background: importText.trim() ? MUSTARD : PAPER_DIM, color: INK, border: "none", padding: "9px 18px",
+              borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: importText.trim() ? "pointer" : "default",
+            }}>Parse file</button>
+          </div>
+
+          {importPreview && (
+            <div style={{ marginTop: 16, borderTop: `1px solid ${LINE}`, paddingTop: 14 }}>
+              <div style={{ fontSize: 13.5, marginBottom: 8 }}>
+                Found <strong>{importPreview.fresh.length}</strong> new booking{importPreview.fresh.length === 1 ? "" : "s"} to add
+                {importPreview.dupes > 0 && <> ({importPreview.dupes} already in your data, skipped)</>}.
+                {importPreview.newProperties.length > 0 && <> Will add new propert{importPreview.newProperties.length === 1 ? "y" : "ies"}: {importPreview.newProperties.join(", ")}.</>}
+              </div>
+              {importPreview.fresh.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto", marginBottom: 12 }}>
+                  {importPreview.fresh.map((b) => (
+                    <div key={b.id} style={{ fontSize: 12.5, display: "flex", gap: 10, padding: "6px 10px", background: PAPER_DIM, borderRadius: 6 }}>
+                      <span style={{ fontWeight: 600, flex: "0 0 120px" }}>{b.guest}</span>
+                      <span style={{ color: TEXT_MUTED }}>{b.checkIn} → {b.checkOut}</span>
+                      <span style={{ marginLeft: "auto" }}>{inr(b.guestPaidAirbnb)} paid · {inr(b.airbnbPayout)} to you</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {importPreview.fresh.length > 0 ? (
+                <button onClick={confirmImport} style={{
+                  background: MUSTARD, color: INK, border: "none", padding: "9px 18px", borderRadius: 8,
+                  fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8,
+                }}>
+                  <Check size={16} /> Add {importPreview.fresh.length} booking{importPreview.fresh.length === 1 ? "" : "s"}
+                </button>
+              ) : (
+                <div style={{ fontSize: 13, color: TEXT_MUTED }}>Nothing new to add — these bookings are already in your data.</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showRestore && (
+        <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 22 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600 }}>Restore from backup</div>
+            <button type="button" onClick={() => { setShowRestore(false); setRestorePreview(null); setRestoreText(""); setRestoreError(""); }}
+              style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}>
+              <X size={18} />
+            </button>
+          </div>
+          <div style={{ fontSize: 13, color: TEXT_MUTED, marginBottom: 12 }}>
+            Use this to bring data made on another device or an older version in sync with what you're looking at now.
+            Upload a CSV from "Download backup CSV" (not an Airbnb export). Matching bookings are updated in place by
+            guest + property + dates; anything new is added. Nothing already here is ever deleted.
+          </div>
+          <input type="file" accept=".csv,text/csv" onChange={handleRestoreFile} style={{ marginBottom: 10, fontSize: 13 }} />
+          <div style={{ fontSize: 12, color: TEXT_MUTED, marginBottom: 6 }}>or paste the CSV contents:</div>
+          <textarea value={restoreText} onChange={(e) => setRestoreText(e.target.value)} placeholder="Guest Name,Phone,Property,Check-in,Check-out,..."
+            style={{ ...inputStyle, minHeight: 90, fontFamily: "monospace", fontSize: 11.5, resize: "vertical" }} />
+          {restoreError && <div style={{ color: "#B6473F", fontSize: 13, marginTop: 8 }}>{restoreError}</div>}
+          <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+            <button onClick={runRestoreParse} disabled={!restoreText.trim()} style={{
+              background: restoreText.trim() ? MUSTARD : PAPER_DIM, color: INK, border: "none", padding: "9px 18px",
+              borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: restoreText.trim() ? "pointer" : "default",
+            }}>Compare</button>
+          </div>
+
+          {restorePreview && (
+            <div style={{ marginTop: 16, borderTop: `1px solid ${LINE}`, paddingTop: 14 }}>
+              <div style={{ fontSize: 13.5, marginBottom: 8 }}>
+                <strong>{restorePreview.toUpdate.length}</strong> existing booking{restorePreview.toUpdate.length === 1 ? "" : "s"} will be updated,
+                {" "}<strong>{restorePreview.toAdd.length}</strong> new booking{restorePreview.toAdd.length === 1 ? "" : "s"} will be added.
+              </div>
+              {restorePreview.toUpdate.length > 0 && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 180, overflowY: "auto", marginBottom: 10 }}>
+                  {restorePreview.toUpdate.map((b) => (
+                    <div key={b.id} style={{ fontSize: 12.5, padding: "6px 10px", background: PAPER_DIM, borderRadius: 6 }}>
+                      <strong>{b.guest}</strong> <span style={{ color: TEXT_MUTED }}>· {b.property} · {b.checkIn} → {b.checkOut} · updating to {inr(b.totalAmount)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {(restorePreview.toUpdate.length > 0 || restorePreview.toAdd.length > 0) ? (
+                <button onClick={confirmRestore} style={{
+                  background: MUSTARD, color: INK, border: "none", padding: "9px 18px", borderRadius: 8,
+                  fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8,
+                }}>
+                  <Check size={16} /> Apply restore
+                </button>
+              ) : (
+                <div style={{ fontSize: 13, color: TEXT_MUTED }}>Everything in this backup already matches what's here.</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showForm && (
+        <div ref={formRef} style={{
+          background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 22,
+        }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600 }}>
+              {form.id ? "Edit booking" : "New booking"}
+            </div>
+            <button type="button" onClick={resetForm} style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}>
+              <X size={18} />
+            </button>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14 }}>
+            <Field label="Guest name *">
+              <input style={inputStyle} value={form.guest} onChange={(e) => setForm({ ...form, guest: e.target.value })} />
+            </Field>
+            <Field label="Phone">
+              <input style={inputStyle} value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+            </Field>
+            <Field label="Property *">
+              <select style={inputStyle} value={form.property} onChange={(e) => setForm({ ...form, property: e.target.value })}>
+                {properties.map((p) => <option key={p}>{p}</option>)}
+              </select>
+            </Field>
+            <Field label="Guests">
+              <input type="number" min="1" style={inputStyle} value={form.guests} onChange={(e) => setForm({ ...form, guests: e.target.value })} />
+            </Field>
+            <Field label="Check-in *">
+              <input type="date" style={inputStyle} value={form.checkIn} onChange={(e) => setForm({ ...form, checkIn: e.target.value })} />
+            </Field>
+            <Field label="Check-out *">
+              <input type="date" style={inputStyle} value={form.checkOut} onChange={(e) => setForm({ ...form, checkOut: e.target.value })} />
+            </Field>
+            <Field label="Total amount (₹)">
+              <input type="number" min="0" style={inputStyle} value={form.totalAmount} onChange={(e) => setForm({ ...form, totalAmount: e.target.value })} />
+            </Field>
+            <Field label="Guest paid via Airbnb (₹)">
+              <input type="number" min="0" style={inputStyle} value={form.guestPaidAirbnb}
+                onChange={(e) => {
+                  const guestPaidAirbnb = e.target.value;
+                  const autoFill = form.airbnbPayout === "" || form.airbnbPayout === emptyForm().airbnbPayout;
+                  setForm((f) => ({
+                    ...f, guestPaidAirbnb,
+                    airbnbPayout: autoFill && guestPaidAirbnb !== "" ? Math.round(Number(guestPaidAirbnb) * 0.97) : f.airbnbPayout,
+                  }));
+                }} />
+            </Field>
+            <Field label="Your Airbnb payout (₹)">
+              <div style={{ display: "flex", gap: 6 }}>
+                <input type="number" min="0" style={inputStyle} value={form.airbnbPayout} onChange={(e) => setForm({ ...form, airbnbPayout: e.target.value })} />
+              </div>
+              <div style={{ fontSize: 11, color: TEXT_MUTED }}>Auto-estimated at 3% fee — overwrite with the real payout once Airbnb shows it.</div>
+            </Field>
+            <Field label="Paid directly (₹)">
+              <input type="number" min="0" style={inputStyle} value={form.amountDirect} onChange={(e) => setForm({ ...form, amountDirect: e.target.value })} />
+            </Field>
+            <Field label="Direct payment mode">
+              <select style={inputStyle} value={form.directMode} onChange={(e) => setForm({ ...form, directMode: e.target.value })}>
+                {DIRECT_PAYMENT_MODES.map((m) => <option key={m}>{m}</option>)}
+              </select>
+            </Field>
+            <Field label="Source">
+              <select style={inputStyle} value={form.source} onChange={(e) => setForm({ ...form, source: e.target.value })}>
+                {SOURCES.map((s) => <option key={s}>{s}</option>)}
+              </select>
+            </Field>
+            <Field label="Entered by">
+              <input style={inputStyle} placeholder="Your name" value={form.enteredBy} onChange={(e) => setForm({ ...form, enteredBy: e.target.value })} />
+            </Field>
+            <Field label="Cancelled?">
+              <select style={inputStyle} value={form.cancelled ? "yes" : "no"} onChange={(e) => setForm({ ...form, cancelled: e.target.value === "yes" })}>
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </Field>
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <Field label="Notes">
+              <textarea style={{ ...inputStyle, minHeight: 60, resize: "vertical" }} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+            </Field>
+          </div>
+          {formError && (
+            <div style={{ color: "#B6473F", fontSize: 13, marginTop: 14, background: "#F6DEDE", padding: "8px 12px", borderRadius: 6 }}>
+              {formError}
+            </div>
+          )}
+          <div style={{ marginTop: 16, display: "flex", gap: 10 }}>
+            <button type="button" onClick={submit} style={{
+              background: MUSTARD, color: INK, border: "none", padding: "10px 20px", borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8,
+            }}>
+              <Check size={16} /> {form.id ? "Save changes" : "Save booking"}
+            </button>
+            <button type="button" onClick={resetForm} style={{
+              background: "#fff", border: `1px solid ${LINE}`, padding: "10px 20px", borderRadius: 8, fontSize: 14, cursor: "pointer",
+            }}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {filtered.length === 0 && <EmptyNote text="No bookings match yet. Add one above to get started." />}
+        {filtered.map((b) => {
+          const { guestPaidAirbnb, airbnbPayout, direct, directMode } = paymentBreakdown(b);
+          const earned = airbnbPayout + direct;
+          const balance = (Number(b.totalAmount) || 0) - guestPaidTotal(b);
+          const parts = [];
+          if (guestPaidAirbnb > 0) parts.push(`${inr(guestPaidAirbnb)} via Airbnb (you got ${inr(airbnbPayout)})`);
+          if (direct > 0) parts.push(`${inr(direct)} via ${directMode}`);
+          const paidLabel = parts.length ? parts.join(" + ") : "not yet paid";
+          return (
+            <div key={b.id} style={{
+              background: "#fff", border: `1px solid ${LINE}`, borderLeft: `4px solid ${propertyColor(properties, b.property)}`,
+              borderRadius: 8, padding: "14px 16px", opacity: b.cancelled ? 0.55 : 1,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+                <div>
+                  <div style={{ fontSize: 15, fontWeight: 600 }}>
+                    {b.guest} {b.cancelled && <span style={{ fontSize: 11.5, color: "#B6473F", fontWeight: 500 }}>· cancelled</span>}
+                  </div>
+                  <div style={{ fontSize: 13, color: TEXT_MUTED, marginTop: 2, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                    <span><Home size={11} style={{ verticalAlign: -1 }} /> {b.property}</span>
+                    <span>{b.checkIn} → {b.checkOut} ({daysBetween(b.checkIn, b.checkOut)}n)</span>
+                    {b.phone && <span><Phone size={11} style={{ verticalAlign: -1 }} /> {b.phone}</span>}
+                    {b.guests && <span><Users size={11} style={{ verticalAlign: -1 }} /> {b.guests}</span>}
+                    <span><Tag size={11} style={{ verticalAlign: -1 }} /> {b.source}</span>
+                  </div>
+                  {b.notes && <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginTop: 4, fontStyle: "italic" }}>{b.notes}</div>}
+                </div>
+                <div style={{ textAlign: "right", flexShrink: 0 }}>
+                  <div style={{ fontSize: 15, fontWeight: 600, color: MUSTARD_DEEP }}>{inr(earned)} <span style={{ fontSize: 11.5, color: TEXT_MUTED, fontWeight: 400 }}>earned</span></div>
+                  <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 1, maxWidth: 220 }}>{paidLabel}</div>
+                  {balance > 0 && !b.cancelled && <div style={{ fontSize: 12.5, color: "#B6473F", marginTop: 2 }}>{inr(balance)} due from guest</div>}
+                  <div style={{ display: "flex", gap: 8, marginTop: 8, justifyContent: "flex-end" }}>
+                    <button onClick={() => editBooking(b)} style={{ background: "none", border: "none", cursor: "pointer", color: INK_SOFT }}><Pencil size={15} /></button>
+                    <button onClick={() => deleteBooking(b.id, b.guest)} style={{ background: "none", border: "none", cursor: "pointer", color: "#B6473F" }}><Trash2 size={15} /></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function CalendarTab({ bookings, properties }) {
+  const [cursor, setCursor] = useState(() => { const d = new Date(); d.setDate(1); return d; });
+  const [selected, setSelected] = useState(null);
+  const active = bookings.filter((b) => !b.cancelled);
+
+  const year = cursor.getFullYear(), month = cursor.getMonth();
+  const firstDay = new Date(year, month, 1);
+  const startOffset = firstDay.getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const cells = [];
+  for (let i = 0; i < startOffset; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  const bookingsForDay = (d) => {
+    const ds = ymdToISO(year, month, d);
+    return active.filter((b) => b.checkIn <= ds && ds < b.checkOut);
+  };
+
+  return (
+    <div>
+      <SectionHeader title="Calendar" subtitle="Occupancy across every property, color-coded." />
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+        <button onClick={() => setCursor(new Date(year, month - 1, 1))} style={navBtnStyle}><ChevronLeft size={18} /></button>
+        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 20, fontWeight: 600 }}>{monthLabel(cursor)}</div>
+        <button onClick={() => setCursor(new Date(year, month + 1, 1))} style={navBtnStyle}><ChevronRight size={18} /></button>
+      </div>
+
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+        {properties.map((p) => (
+          <div key={p} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: TEXT_MUTED }}>
+            <div style={{ width: 9, height: 9, borderRadius: "50%", background: propertyColor(properties, p) }} />{p}
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+        {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
+          <div key={d} style={{ fontSize: 11.5, color: TEXT_MUTED, textAlign: "center", paddingBottom: 4 }}>{d}</div>
+        ))}
+        {cells.map((d, i) => {
+          if (!d) return <div key={i} />;
+          const ds = ymdToISO(year, month, d);
+          const dayBookings = bookingsForDay(d);
+          const isToday = ds === todayStr();
+          return (
+            <div key={i} onClick={() => setSelected(ds)} style={{
+              minHeight: 64, background: "#fff", border: `1px solid ${isToday ? MUSTARD : LINE}`,
+              borderRadius: 7, padding: 6, cursor: "pointer", position: "relative",
+            }}>
+              <div style={{ fontSize: 12, fontWeight: isToday ? 700 : 500, color: isToday ? MUSTARD_DEEP : INK }}>{d}</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
+                {dayBookings.slice(0, 3).map((b) => (
+                  <div key={b.id} style={{
+                    background: propertyColor(properties, b.property), color: "#fff", fontSize: 9.5,
+                    borderRadius: 3, padding: "1px 4px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}>{b.guest}</div>
+                ))}
+                {dayBookings.length > 3 && <div style={{ fontSize: 9.5, color: TEXT_MUTED }}>+{dayBookings.length - 3} more</div>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {selected && (
+        <div style={{ marginTop: 20, background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 16 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontWeight: 600, fontSize: 14.5 }}>
+              {new Date(selected + "T00:00:00").toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" })}
+            </div>
+            <button onClick={() => setSelected(null)} style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}><X size={16} /></button>
+          </div>
+          {active.filter((b) => b.checkIn <= selected && selected < b.checkOut).length === 0 ? (
+            <EmptyNote text="No stays on this date." />
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {active.filter((b) => b.checkIn <= selected && selected < b.checkOut).map((b) => (
+                <div key={b.id} style={{ fontSize: 13.5, display: "flex", gap: 10, alignItems: "center" }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: propertyColor(properties, b.property) }} />
+                  <span style={{ fontWeight: 500 }}>{b.guest}</span>
+                  <span style={{ color: TEXT_MUTED }}>· {b.property} · {b.checkIn === selected ? "checking in" : b.checkOut === addDays(selected, 1) ? "checking out tomorrow" : "staying"}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+const navBtnStyle = { background: "#fff", border: `1px solid ${LINE}`, borderRadius: 7, padding: 8, cursor: "pointer", display: "flex" };
+
+const DIRECT_COLOR = "#3B7A9E";
+
+function RevenueTab({ bookings, properties }) {
+  const active = bookings.filter((b) => !b.cancelled);
+  const [selectedMonthKey, setSelectedMonthKey] = useState(null);
+
+  // Splits every booking's earnings across the calendar months it actually spans, proportional
+  // to nights in each month — a booking running Aug 30 → Sep 3 contributes to both August and
+  // September instead of being dumped entirely into its check-in month.
+  const monthly = useMemo(() => {
+    const now = new Date();
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({
+        key: `${d.getFullYear()}-${d.getMonth()}`,
+        label: d.toLocaleDateString("en-IN", { month: "short", year: "2-digit" }),
+        airbnb: 0, direct: 0, revenue: 0, items: [],
+      });
+    }
+    const byKey = Object.fromEntries(months.map((m) => [m.key, m]));
+
+    active.forEach((b) => {
+      const split = nightsByMonth(b.checkIn, b.checkOut);
+      const totalNights = Object.values(split).reduce((s, n) => s + n, 0) || 1;
+      const spansMultiple = Object.keys(split).length > 1;
+      const { airbnbPayout, direct } = paymentBreakdown(b);
+      Object.entries(split).forEach(([key, nights]) => {
+        const m = byKey[key];
+        if (!m) return;
+        const frac = nights / totalNights;
+        const allocAirbnb = airbnbPayout * frac, allocDirect = direct * frac;
+        m.airbnb += allocAirbnb;
+        m.direct += allocDirect;
+        m.revenue += allocAirbnb + allocDirect;
+        m.items.push({ booking: b, nights, totalNights, spansMultiple, allocated: allocAirbnb + allocDirect });
+      });
+    });
+    return months;
+  }, [active]);
+
+  const byMode = useMemo(() => {
+    const map = {};
+    active.forEach((b) => {
+      const { airbnbPayout, direct, directMode } = paymentBreakdown(b);
+      if (airbnbPayout > 0) map["Airbnb Payout"] = (map["Airbnb Payout"] || 0) + airbnbPayout;
+      if (direct > 0) map[directMode] = (map[directMode] || 0) + direct;
+    });
+    return Object.entries(map).filter(([, v]) => v > 0);
+  }, [active]);
+
+  const byPropertyMode = useMemo(() => {
+    // Property x payment-source drill-down: for each property, how much came via Airbnb vs direct.
+    const map = {};
+    properties.forEach((p) => (map[p] = { airbnb: 0, direct: 0 }));
+    active.forEach((b) => {
+      const { airbnbPayout, direct } = paymentBreakdown(b);
+      if (!map[b.property]) map[b.property] = { airbnb: 0, direct: 0 };
+      map[b.property].airbnb += airbnbPayout;
+      map[b.property].direct += direct;
+    });
+    return map;
+  }, [active, properties]);
+
+  const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
+  const totalDirect = active.reduce((s, b) => s + paymentBreakdown(b).direct, 0);
+  const totalFees = active.reduce((s, b) => {
+    const { guestPaidAirbnb, airbnbPayout } = paymentBreakdown(b);
+    return s + Math.max(0, guestPaidAirbnb - airbnbPayout);
+  }, 0);
+
+  const selectedMonth = monthly.find((m) => m.key === selectedMonthKey);
+
+  return (
+    <div>
+      <SectionHeader title="Revenue" subtitle="Monthly trend, payment breakdown, and drill-down across all properties." />
+
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
+        <StatCard label="Total revenue" value={inr(totalRevenue)} accent={MUSTARD_DEEP} />
+        <StatCard label="From direct payments" value={inr(totalDirect)} sub={totalRevenue ? `${Math.round((totalDirect / totalRevenue) * 100)}% of total` : undefined} />
+        <StatCard label="Airbnb fees & taxes absorbed" value={inr(totalFees)} />
+      </div>
+
+      <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
+        <PanelHeader>Last 12 months — tap a bar to drill in (mustard = Airbnb, blue = direct)</PanelHeader>
+        <ResponsiveContainer width="100%" height={240}>
+          <BarChart data={monthly} onClick={(e) => {
+            if (e && typeof e.activeTooltipIndex === "number") {
+              const m = monthly[e.activeTooltipIndex];
+              setSelectedMonthKey(m.key === selectedMonthKey ? null : m.key);
+            }
+          }}>
+            <CartesianGrid strokeDasharray="3 3" stroke={LINE} vertical={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 12, fill: TEXT_MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
+            <YAxis tick={{ fontSize: 11, fill: TEXT_MUTED }} axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v >= 1000 ? (v / 1000) + "k" : v}`} />
+            <Tooltip formatter={(v, name) => [inr(v), name === "airbnb" ? "Airbnb" : "Direct"]} contentStyle={{ fontSize: 13, borderRadius: 8, border: `1px solid ${LINE}` }} />
+            <Bar dataKey="airbnb" stackId="rev" fill={MUSTARD} radius={[0, 0, 0, 0]} cursor="pointer" />
+            <Bar dataKey="direct" stackId="rev" fill={DIRECT_COLOR} radius={[4, 4, 0, 0]} cursor="pointer" />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {selectedMonth && (
+        <div style={{ background: "#fff", border: `1px solid ${MUSTARD}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 17, fontWeight: 600 }}>{selectedMonth.label} in detail</div>
+            <button onClick={() => setSelectedMonthKey(null)} style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}><X size={16} /></button>
+          </div>
+          <div style={{ fontSize: 13, color: TEXT_MUTED, marginBottom: 12 }}>
+            {inr(selectedMonth.revenue)} total — {inr(selectedMonth.airbnb)} via Airbnb, {inr(selectedMonth.direct)} direct
+          </div>
+          {selectedMonth.items.length === 0 ? <EmptyNote text="No stays overlap this month." /> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {selectedMonth.items.map((it, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                  <span>
+                    <strong>{it.booking.guest}</strong> · {it.booking.property}
+                    <span style={{ color: TEXT_MUTED }}> · {it.booking.checkIn} → {it.booking.checkOut}</span>
+                    {it.spansMultiple && <span style={{ color: MUSTARD_DEEP }}> · {it.nights}/{it.totalNights} nights this month</span>}
+                  </span>
+                  <span style={{ fontWeight: 500, flexShrink: 0 }}>{inr(it.allocated)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
+          <PanelHeader>By payment mode</PanelHeader>
+          {byMode.length === 0 ? <EmptyNote text="No payments recorded yet." /> : byMode.map(([mode, val]) => (
+            <div key={mode} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+              <span>{mode}</span>
+              <span style={{ fontWeight: 500 }}>{inr(val)} <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>({Math.round((val / totalRevenue) * 100) || 0}%)</span></span>
+            </div>
+          ))}
+          {totalFees > 0 && (
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "9px 0 0", color: "#B6473F" }}>
+              <span>Airbnb fees & taxes absorbed</span>
+              <span style={{ fontWeight: 500 }}>−{inr(totalFees)}</span>
+            </div>
+          )}
+        </div>
+        <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
+          <PanelHeader>By property (Airbnb vs. direct)</PanelHeader>
+          {properties.map((p) => {
+            const { airbnb, direct } = byPropertyMode[p] || { airbnb: 0, direct: 0 };
+            const val = airbnb + direct;
+            return (
+              <div key={p} style={{ padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5 }}>
+                  <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: propertyColor(properties, p) }} />{p}
+                  </span>
+                  <span style={{ fontWeight: 500 }}>{inr(val)}</span>
+                </div>
+                {val > 0 && (
+                  <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 2, marginLeft: 16 }}>
+                    {inr(airbnb)} Airbnb · {inr(direct)} direct
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
