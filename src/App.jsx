@@ -103,7 +103,7 @@ function emptyForm() {
     id: null, guest: "", phone: "", property: "", checkIn: todayStr(),
     checkOut: addDays(todayStr(), 1), guests: 1, totalAmount: "",
     guestPaidAirbnb: "", airbnbPayout: "", amountDirect: "", directMode: "UPI",
-    source: "Airbnb", enteredBy: "", notes: "", cancelled: false,
+    source: "Airbnb", createdBy: "", updatedBy: "", notes: "", cancelled: false,
   };
 }
 
@@ -208,8 +208,8 @@ function parseBackupCSV(text) {
     checkIn: idx("Check-in"), checkOut: idx("Check-out"), guests: idx("Guests"),
     totalAmount: idx("Total Amount"), guestPaidAirbnb: idx("Guest Paid via Airbnb"),
     airbnbPayout: idx("Your Airbnb Payout"), amountDirect: idx("Paid Directly"),
-    directMode: idx("Direct Payment Mode"), source: idx("Source"), enteredBy: idx("Entered By"),
-    notes: idx("Notes"), cancelled: idx("Cancelled"),
+    directMode: idx("Direct Payment Mode"), source: idx("Source"), createdBy: idx("Created By"),
+    updatedBy: idx("Updated By"), notes: idx("Notes"), cancelled: idx("Cancelled"),
   };
   const rows = [];
   for (let i = 1; i < lines.length; i++) {
@@ -229,7 +229,8 @@ function parseBackupCSV(text) {
       amountDirect: row[cols.amountDirect] || "",
       directMode: row[cols.directMode] || "UPI",
       source: row[cols.source] || "Other",
-      enteredBy: row[cols.enteredBy] || "",
+      createdBy: row[cols.createdBy] || "",
+      updatedBy: row[cols.updatedBy] || "",
       notes: row[cols.notes] || "",
       cancelled: (row[cols.cancelled] || "").trim().toUpperCase() === "Y",
     });
@@ -259,7 +260,8 @@ function rowToBooking(r) {
     amountDirect: r.amount_direct ?? "",
     directMode: r.direct_mode || "UPI",
     source: r.source || "Airbnb",
-    enteredBy: r.entered_by || "",
+    createdBy: r.created_by || "",
+    updatedBy: r.updated_by || "",
     notes: r.notes || "",
     cancelled: !!r.cancelled,
   };
@@ -281,7 +283,8 @@ function bookingToRow(b) {
     amount_direct: num(b.amountDirect),
     direct_mode: b.directMode || null,
     source: b.source || null,
-    entered_by: b.enteredBy || null,
+    created_by: b.createdBy || null,
+    updated_by: b.updatedBy || null,
     notes: b.notes || null,
     cancelled: !!b.cancelled,
   };
@@ -361,7 +364,77 @@ function useStorage() {
   return { bookings, properties, loading, error, persistBookings, persistProperties };
 }
 
+// Tracks the current Supabase Auth session. Staff accounts are created by the property owner
+// directly in Supabase (Authentication -> Users -> Add user) — there's no public sign-up screen
+// here, since this is an internal team tool, not a consumer product.
+function useAuth() {
+  const [session, setSession] = useState(undefined); // undefined = still checking, null = signed out
+  useEffect(() => {
+    if (!supabaseConfigured) return; // App() shows a setup-error screen in this case instead
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, sess) => setSession(sess));
+    return () => listener.subscription.unsubscribe();
+  }, []);
+  const signOut = () => supabase && supabase.auth.signOut();
+  return { session, loading: supabaseConfigured && session === undefined, signOut };
+}
+
+function LoginScreen() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async () => {
+    if (!email.trim() || !password) return setError("Enter your email and password.");
+    setError("");
+    setSubmitting(true);
+    const { error: signInError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+    setSubmitting(false);
+    if (signInError) setError(signInError.message || "Could not sign in — check your email and password.");
+  };
+
+  return (
+    <div style={{
+      fontFamily: "'IBM Plex Sans', sans-serif", minHeight: "100vh", background: PAPER,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+    }}>
+      <style>{FONT_IMPORT}</style>
+      <div style={{ maxWidth: 380, width: "100%", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 28 }}>
+        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 26, fontWeight: 600, color: INK, marginBottom: 4 }}>Spare Key</div>
+        <div style={{ fontSize: 13.5, color: TEXT_MUTED, marginBottom: 22 }}>Sign in with your staff account to continue.</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <Field label="Email">
+            <input type="email" style={inputStyle} value={email} onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()} autoFocus />
+          </Field>
+          <Field label="Password">
+            <input type="password" style={inputStyle} value={password} onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submit()} />
+          </Field>
+        </div>
+        {error && (
+          <div style={{ color: "#B6473F", fontSize: 13, marginTop: 12, background: "#F6DEDE", padding: "8px 12px", borderRadius: 6 }}>
+            {error}
+          </div>
+        )}
+        <button type="button" onClick={submit} disabled={submitting} style={{
+          marginTop: 16, width: "100%", background: MUSTARD, color: INK, border: "none", padding: "11px 18px",
+          borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: submitting ? "default" : "pointer", opacity: submitting ? 0.7 : 1,
+        }}>
+          {submitting ? "Signing in…" : "Sign in"}
+        </button>
+        <div style={{ fontSize: 12, color: TEXT_MUTED, marginTop: 16 }}>
+          Don't have an account? Ask the property owner to add you in Supabase.
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  const { session, loading: authLoading, signOut } = useAuth();
+
   if (!supabaseConfigured) {
     return (
       <div style={{
@@ -384,10 +457,12 @@ export default function App() {
       </div>
     );
   }
-  return <AppShell />;
+  if (authLoading) return null; // avoids a login-screen flash while the session check resolves
+  if (!session) return <LoginScreen />;
+  return <AppShell userEmail={session.user.email} onSignOut={signOut} />;
 }
 
-function AppShell() {
+function AppShell({ userEmail, onSignOut }) {
   const { bookings, properties, loading, error, persistBookings, persistProperties } = useStorage();
   const [tab, setTab] = useState("dashboard");
   const [navOpen, setNavOpen] = useState(false);
@@ -421,7 +496,7 @@ function AppShell() {
           display: navOpen ? "flex" : "none", flexDirection: "column",
           position: "fixed", top: 0, bottom: 0, left: 0, zIndex: 40,
         }} className="sidebar-desktop">
-          <SidebarContent tab={tab} setTab={(t) => { setTab(t); setNavOpen(false); }} nav={NAV} />
+          <SidebarContent tab={tab} setTab={(t) => { setTab(t); setNavOpen(false); }} nav={NAV} userEmail={userEmail} onSignOut={onSignOut} />
         </div>
 
         <style>{`
@@ -459,6 +534,7 @@ function AppShell() {
                   <BookingsTab
                     bookings={bookings} properties={properties}
                     persistBookings={persistBookings} persistProperties={persistProperties}
+                    userEmail={userEmail}
                   />
                 )}
                 {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} />}
@@ -471,7 +547,7 @@ function AppShell() {
     </div>
   );
 }
-function SidebarContent({ tab, setTab, nav }) {
+function SidebarContent({ tab, setTab, nav, userEmail, onSignOut }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: "28px 0" }}>
       <div style={{ padding: "0 24px 28px", borderBottom: `1px solid ${INK_SOFT}` }}>
@@ -489,6 +565,15 @@ function SidebarContent({ tab, setTab, nav }) {
             <Icon size={17} /> {label}
           </button>
         ))}
+      </div>
+      <div style={{ padding: "14px 24px 0", borderTop: `1px solid ${INK_SOFT}` }}>
+        <div style={{ fontSize: 12, color: "#AEB8CC", marginBottom: 8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          Signed in as {userEmail}
+        </div>
+        <button onClick={onSignOut} style={{
+          background: "none", border: `1px solid ${INK_SOFT}`, color: PAPER, padding: "7px 12px",
+          borderRadius: 6, fontSize: 12.5, cursor: "pointer", width: "100%",
+        }}>Sign out</button>
       </div>
     </div>
   );
@@ -651,7 +736,7 @@ function downloadBackupCSV(bookings) {
   const cols = [
     "Guest Name", "Phone", "Property", "Check-in", "Check-out", "Guests", "Total Amount",
     "Guest Paid via Airbnb", "Your Airbnb Payout", "Paid Directly", "Direct Payment Mode",
-    "Source", "Entered By", "Notes", "Cancelled",
+    "Source", "Created By", "Updated By", "Notes", "Cancelled",
   ];
   const esc = (v) => {
     const s = v === undefined || v === null ? "" : String(v);
@@ -662,7 +747,7 @@ function downloadBackupCSV(bookings) {
     return [
       b.guest, b.phone, b.property, b.checkIn, b.checkOut, b.guests, b.totalAmount,
       guestPaidAirbnb || "", airbnbPayout || "", direct || "", direct ? directMode : "",
-      b.source, b.enteredBy, b.notes, b.cancelled ? "Y" : "N",
+      b.source, b.createdBy, b.updatedBy, b.notes, b.cancelled ? "Y" : "N",
     ].map(esc).join(",");
   });
   const csv = [cols.join(","), ...rows].join("\n");
@@ -677,7 +762,8 @@ function downloadBackupCSV(bookings) {
   URL.revokeObjectURL(url);
 }
 
-function BookingsTab({ bookings, properties, persistBookings, persistProperties }) {
+
+function BookingsTab({ bookings, properties, persistBookings, persistProperties, userEmail }) {
   const [form, setForm] = useState(emptyForm());
   const [showForm, setShowForm] = useState(false);
   const [newProperty, setNewProperty] = useState("");
@@ -715,7 +801,13 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties 
     if (!form.checkIn) return setFormError("Check-in date is required.");
     if (!form.checkOut) return setFormError("Check-out date is required.");
     setFormError("");
-    const record = { ...form, id: form.id || (Date.now() + "-" + Math.random().toString(36).slice(2)) };
+    const isNew = !form.id;
+    const record = {
+      ...form,
+      id: form.id || (Date.now() + "-" + Math.random().toString(36).slice(2)),
+      createdBy: isNew ? userEmail : form.createdBy || userEmail,
+      updatedBy: userEmail,
+    };
     let next;
     if (form.id) {
       next = bookings.map((b) => (b.id === form.id ? record : b));
@@ -770,7 +862,8 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties 
     if (importPreview.newProperties.length) {
       persistProperties([...properties, ...importPreview.newProperties]);
     }
-    persistBookings([...bookings, ...importPreview.fresh]);
+    const stamped = importPreview.fresh.map((b) => ({ ...b, createdBy: userEmail, updatedBy: userEmail }));
+    persistBookings([...bookings, ...stamped]);
     setShowImport(false); setImportText(""); setImportPreview(null); setImportError("");
   };
 
@@ -797,8 +890,8 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties 
       parsed.forEach((row) => {
         const key = bookingNaturalKey(row);
         const match = existingByKey[key];
-        if (match) toUpdate.push({ ...row, id: match.id, importRef: match.importRef });
-        else toAdd.push({ ...row, id: Date.now() + "-" + Math.random().toString(36).slice(2) });
+        if (match) toUpdate.push({ ...row, id: match.id, importRef: match.importRef, createdBy: match.createdBy || row.createdBy || userEmail, updatedBy: userEmail });
+        else toAdd.push({ ...row, id: Date.now() + "-" + Math.random().toString(36).slice(2), createdBy: row.createdBy || userEmail, updatedBy: userEmail });
       });
       setRestorePreview({ toUpdate, toAdd });
     } catch (err) {
@@ -1043,8 +1136,10 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties 
                 {SOURCES.map((s) => <option key={s}>{s}</option>)}
               </select>
             </Field>
-            <Field label="Entered by">
-              <input style={inputStyle} placeholder="Your name" value={form.enteredBy} onChange={(e) => setForm({ ...form, enteredBy: e.target.value })} />
+            <Field label="Logged by">
+              <div style={{ ...inputStyle, background: PAPER_DIM, color: TEXT_MUTED, cursor: "default" }}>
+                {form.id ? (form.createdBy || "—") : "You, on save"}
+              </div>
             </Field>
             <Field label="Cancelled?">
               <select style={inputStyle} value={form.cancelled ? "yes" : "no"} onChange={(e) => setForm({ ...form, cancelled: e.target.value === "yes" })}>
@@ -1105,6 +1200,11 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties 
                     <span><Tag size={11} style={{ verticalAlign: -1 }} /> {b.source}</span>
                   </div>
                   {b.notes && <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginTop: 4, fontStyle: "italic" }}>{b.notes}</div>}
+                  {b.createdBy && (
+                    <div style={{ fontSize: 11, color: "#9AA3B0", marginTop: 4 }}>
+                      Logged by {b.createdBy}{b.updatedBy && b.updatedBy !== b.createdBy && <> · edited by {b.updatedBy}</>}
+                    </div>
+                  )}
                 </div>
                 <div style={{ textAlign: "right", flexShrink: 0 }}>
                   <div style={{ fontSize: 15, fontWeight: 600, color: MUSTARD_DEEP }}>{inr(earned)} <span style={{ fontSize: 11.5, color: TEXT_MUTED, fontWeight: 400 }}>earned</span></div>
