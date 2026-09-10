@@ -95,6 +95,11 @@ function todayStrIST() {
 function isPastCheckoutTimeIST() {
   return nowIST().getUTCHours() >= 12;
 }
+// Guests are expected to have checked in by 1 PM — once past that, treat today's check-in as
+// already done, so the Dashboard's "next check-in" moves on to whoever's actually still upcoming.
+function isPastCheckinTimeIST() {
+  return nowIST().getUTCHours() >= 13;
+}
 function daysBetween(a, b) {
   return Math.round((new Date(b) - new Date(a)) / 86400000);
 }
@@ -757,15 +762,17 @@ function Dashboard({ bookings, properties, setTab, onAddProperty }) {
   const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
   const totalOutstanding = active.reduce((s, b) => s + (Number(b.dueAmount) || 0), 0);
   const today = todayStrIST();
-  // Once past noon IST, today's checkout is treated as already done, so "next" skips ahead to
-  // whatever's actually still upcoming instead of pointing at a guest who's already left.
+  // Once past noon/1 PM IST, today's checkout/check-in is treated as already done, so "next"
+  // skips ahead to whatever's actually still upcoming instead of pointing at a guest who's
+  // already left or already arrived.
   const checkoutFloor = isPastCheckoutTimeIST() ? addDays(today, 1) : today;
+  const checkinFloor = isPastCheckinTimeIST() ? addDays(today, 1) : today;
 
   const nextCheckout = active
     .filter((b) => b.checkOut >= checkoutFloor)
     .sort((a, b) => a.checkOut.localeCompare(b.checkOut))[0] || null;
   const nextCheckin = active
-    .filter((b) => b.checkIn >= today)
+    .filter((b) => b.checkIn >= checkinFloor)
     .sort((a, b) => a.checkIn.localeCompare(b.checkIn))[0] || null;
 
   const byProperty = properties.map((p) => ({
