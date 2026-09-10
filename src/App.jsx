@@ -4,7 +4,7 @@ import {
 } from "recharts";
 import {
   LayoutDashboard, NotebookPen, CalendarDays, IndianRupee, Plus, Trash2, Pencil,
-  ChevronLeft, ChevronRight, X, Check, Phone, Users, Tag, Home, Upload, Download,
+  ChevronLeft, ChevronRight, X, Check, Phone, Users, Tag, Home, Upload, Download, Wallet,
 } from "lucide-react";
 import { supabase, supabaseConfigured } from "./supabaseClient";
 
@@ -23,6 +23,7 @@ const DEFAULT_PROPERTIES = ["Whimsy Suite"];
 const PROPERTY_COLORS = ["#B6473F", "#2F6F8F", "#3F6B4E", "#8A5FA6", "#B8862E", "#4A6670"];
 const DIRECT_PAYMENT_MODES = ["UPI", "Cash", "Bank Transfer", "Card", "Other"];
 const SOURCES = ["Airbnb", "Direct", "Referral", "Other"];
+const EXPENSE_CATEGORIES = ["Utilities", "Maintenance", "Cleaning", "Staff", "Supplies", "Subscription", "Platform fees", "Other"];
 
 function propertyColor(properties, name) {
   const idx = properties.indexOf(name);
@@ -98,6 +99,39 @@ function nightsByMonth(checkIn, checkOut) {
 function monthLabel(d) {
   return d.toLocaleDateString("en-IN", { month: "short", year: "numeric" });
 }
+// Same "YYYY-M" key shape used throughout (nightsByMonth, RevenueTab's monthly buckets), built
+// from a date string instead of walking nights — used to place fixed/one-time expenses in months.
+function monthKeyOf(dateStr) {
+  const d = new Date(dateStr + "T00:00:00");
+  return `${d.getFullYear()}-${d.getMonth()}`;
+}
+// A fixed expense recurs every month from start_date through end_date (inclusive), or indefinitely
+// if end_date is null. Compares by month key so a start/end date's day-of-month is irrelevant.
+function fixedExpenseAppliesToMonthKey(exp, monthKey) {
+  if (!exp.startDate) return false;
+  const [y, m] = monthKey.split("-").map(Number);
+  const monthStart = new Date(y, m, 1);
+  const start = new Date(exp.startDate + "T00:00:00");
+  if (monthStart < new Date(start.getFullYear(), start.getMonth(), 1)) return false;
+  if (exp.endDate) {
+    const end = new Date(exp.endDate + "T00:00:00");
+    if (monthStart > new Date(end.getFullYear(), end.getMonth(), 1)) return false;
+  }
+  return true;
+}
+function expensesForMonthKey(expenses, monthKey) {
+  return expenses.reduce((sum, exp) => {
+    if (exp.kind === "fixed") return sum + (fixedExpenseAppliesToMonthKey(exp, monthKey) ? Number(exp.amount) || 0 : 0);
+    return sum + (exp.expenseDate && monthKeyOf(exp.expenseDate) === monthKey ? Number(exp.amount) || 0 : 0);
+  }, 0);
+}
+function emptyExpenseForm() {
+  return {
+    id: null, kind: "one_time", name: "", category: EXPENSE_CATEGORIES[0], amount: "",
+    property: "", expenseDate: todayStr(), startDate: todayStr(), endDate: "",
+    notes: "", createdBy: "", updatedBy: "",
+  };
+}
 function emptyForm() {
   return {
     id: null, guest: "", phone: "", property: "", checkIn: todayStr(),
@@ -133,6 +167,15 @@ function parseCSVLine(line) {
 // pre-fee amount; Tax Withholding / adjustment rows for the same Confirmation Code adjust it
 // down to the real payout, so amounts are summed per Confirmation Code rather than read off
 // a single row.
+// Parses Airbnb's transaction/earnings CSV export (works for both the "completed" and "upcoming"
+// exports \u2014 their headers differ slightly, e.g. "upcoming" lacks an "Arriving by date" column, but
+// every field below is looked up by name so column position doesn't matter). Only "Reservation"
+// rows carry the numbers we need; "Payout" rows (bank transfers) and "Tax Withholding for India
+// Income" rows (a minor TDS deduction, deliberately ignored here) are skipped entirely.
+// - Guest paid on Airbnb = Amount + Service fee + Airbnb remitted tax (the GST Airbnb collects
+//   from the guest and remits directly \u2014 "Gross earnings" alone omits it).
+// - Your payout = Amount, as-is (the real bank deposit is a few rupees less, after the ignored
+//   income-tax withholding, but that gap is negligible for this purpose).
 function parseAirbnbCSV(text, existingProperties) {
   const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (lines.length < 2) return { bookings: [], newProperties: [] };
@@ -140,58 +183,51 @@ function parseAirbnbCSV(text, existingProperties) {
   const idx = (name) => header.indexOf(name);
   const iType = idx("Type"), iConf = idx("Confirmation Code"), iStart = idx("Start date"),
     iEnd = idx("End date"), iGuest = idx("Guest"), iListing = idx("Listing"),
-    iAmount = idx("Amount"), iGross = idx("Gross earnings");
-
-  const byCode = {};
-  for (let i = 1; i < lines.length; i++) {
-    const row = parseCSVLine(lines[i]);
-    const type = row[iType] || "";
-    const code = (row[iConf] || "").trim();
-    if (!code || type === "Payout") continue;
-    if (!byCode[code]) {
-      byCode[code] = {
-        code, guest: row[iGuest] || "", listing: row[iListing] || "",
-        startDate: row[iStart] || "", endDate: row[iEnd] || "", gross: 0, amountSum: 0,
-      };
-    }
-    const entry = byCode[code];
-    const gross = parseFloat(row[iGross]);
-    if (!isNaN(gross) && gross !== 0) entry.gross = gross;
-    const amt = parseFloat(row[iAmount]);
-    if (!isNaN(amt)) entry.amountSum += amt;
-    if (row[iStart]) entry.startDate = entry.startDate || row[iStart];
-    if (row[iEnd]) entry.endDate = entry.endDate || row[iEnd];
-  }
+    iAmount = idx("Amount"), iServiceFee = idx("Service fee"), iTax = idx("Airbnb remitted tax");
 
   const newProperties = [];
-  const bookings = Object.values(byCode).map((e) => {
-    let property = existingProperties.find((p) => e.listing.includes(p));
+  const seen = new Set();
+  const bookings = [];
+  for (let i = 1; i < lines.length; i++) {
+    const row = parseCSVLine(lines[i]);
+    if ((row[iType] || "").trim() !== "Reservation") continue;
+    const code = (row[iConf] || "").trim();
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+
+    const amount = parseFloat(row[iAmount]) || 0;
+    const serviceFee = parseFloat(row[iServiceFee]) || 0;
+    const airbnbTax = parseFloat(row[iTax]) || 0;
+    const guestPaidAirbnb = amount + serviceFee + airbnbTax;
+    const airbnbPayout = amount;
+
+    const listing = row[iListing] || "";
+    let property = existingProperties.find((p) => listing.includes(p));
     if (!property) {
-      property = (e.listing.split("|")[0] || e.listing).trim();
+      property = (listing.split("|")[0] || listing).trim();
       if (property && !existingProperties.includes(property) && !newProperties.includes(property)) {
         newProperties.push(property);
       }
     }
-    const guestPaidAirbnb = e.gross || Math.max(0, e.amountSum);
-    const airbnbPayout = Math.max(0, e.amountSum);
-    return {
+
+    bookings.push({
       ...emptyForm(),
-      id: "import-" + e.code,
-      importRef: e.code,
-      guest: e.guest,
+      id: "import-" + code,
+      importRef: code,
+      guest: row[iGuest] || "",
       property,
-      checkIn: toISODate(e.startDate),
-      checkOut: toISODate(e.endDate),
+      checkIn: toISODate(row[iStart]),
+      checkOut: toISODate(row[iEnd]),
       totalAmount: guestPaidAirbnb || "",
       guestPaidAirbnb: guestPaidAirbnb || "",
       airbnbPayout: airbnbPayout || "",
       amountDirect: "",
       source: "Airbnb",
-      notes: `Imported from Airbnb (confirmation ${e.code})`,
-    };
-  }).filter((b) => b.guest && b.checkIn);
+      notes: `Imported from Airbnb (confirmation ${code})`,
+    });
+  }
 
-  return { bookings, newProperties };
+  return { bookings: bookings.filter((b) => b.guest && b.checkIn), newProperties };
 }
 
 // Parses Stay Ledger's own "Download backup CSV" format (not Airbnb's) — used to merge data
@@ -290,9 +326,44 @@ function bookingToRow(b) {
   };
 }
 
+function rowToExpense(r) {
+  return {
+    id: r.id,
+    kind: r.kind || "one_time",
+    name: r.name || "",
+    category: r.category || EXPENSE_CATEGORIES[0],
+    amount: r.amount ?? "",
+    property: r.property || "",
+    expenseDate: r.expense_date || "",
+    startDate: r.start_date || "",
+    endDate: r.end_date || "",
+    notes: r.notes || "",
+    createdBy: r.created_by || "",
+    updatedBy: r.updated_by || "",
+  };
+}
+function expenseToRow(e) {
+  const num = (v) => (v === "" || v === undefined || v === null ? null : Number(v));
+  return {
+    id: e.id,
+    kind: e.kind || "one_time",
+    name: e.name || "",
+    category: e.category || null,
+    amount: num(e.amount) || 0,
+    property: e.property || null,
+    expense_date: e.kind === "one_time" ? (e.expenseDate || null) : null,
+    start_date: e.kind === "fixed" ? (e.startDate || null) : null,
+    end_date: e.kind === "fixed" ? (e.endDate || null) : null,
+    notes: e.notes || null,
+    created_by: e.createdBy || null,
+    updated_by: e.updatedBy || null,
+  };
+}
+
 function useStorage() {
   const [bookings, setBookings] = useState([]);
   const [properties, setProperties] = useState(DEFAULT_PROPERTIES);
+  const [expenses, setExpenses] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -305,9 +376,13 @@ function useStorage() {
         const { data: pRows, error: pErr } = await supabase
           .from("properties").select("*").order("name");
         if (pErr) throw pErr;
+        const { data: eRows, error: eErr } = await supabase
+          .from("expenses").select("*").order("created_at", { ascending: false });
+        if (eErr) throw eErr;
 
         setBookings((bRows || []).map(rowToBooking));
         setProperties((pRows || []).length ? pRows.map((r) => r.name) : DEFAULT_PROPERTIES);
+        setExpenses((eRows || []).map(rowToExpense));
       } catch (e) {
         console.error(e);
         setError("Could not load saved data — check your Supabase connection.");
@@ -361,7 +436,29 @@ function useStorage() {
     }
   }, [properties]);
 
-  return { bookings, properties, loading, error, persistBookings, persistProperties };
+  const persistExpenses = useCallback(async (next) => {
+    const prevIds = new Set(expenses.map((e) => e.id));
+    const nextIds = new Set(next.map((e) => e.id));
+    const removedIds = [...prevIds].filter((id) => !nextIds.has(id));
+    setExpenses(next);
+    try {
+      if (next.length) {
+        const rows = next.map(expenseToRow);
+        const { error: upErr } = await supabase.from("expenses").upsert(rows, { onConflict: "id" });
+        if (upErr) throw upErr;
+      }
+      if (removedIds.length) {
+        const { error: delErr } = await supabase.from("expenses").delete().in("id", removedIds);
+        if (delErr) throw delErr;
+      }
+      setError("");
+    } catch (e) {
+      console.error(e);
+      setError("Save failed — changes may not persist. Check your Supabase connection.");
+    }
+  }, [expenses]);
+
+  return { bookings, properties, expenses, loading, error, persistBookings, persistProperties, persistExpenses };
 }
 
 // Tracks the current Supabase Auth session. Staff accounts are created by the property owner
@@ -463,7 +560,7 @@ export default function App() {
 }
 
 function AppShell({ userEmail, onSignOut }) {
-  const { bookings, properties, loading, error, persistBookings, persistProperties } = useStorage();
+  const { bookings, properties, expenses, loading, error, persistBookings, persistProperties, persistExpenses } = useStorage();
   const [tab, setTab] = useState("dashboard");
   const [navOpen, setNavOpen] = useState(false);
 
@@ -472,6 +569,7 @@ function AppShell({ userEmail, onSignOut }) {
     { id: "bookings", label: "Bookings", icon: NotebookPen },
     { id: "calendar", label: "Calendar", icon: CalendarDays },
     { id: "revenue", label: "Revenue", icon: IndianRupee },
+    { id: "expenses", label: "Expenses", icon: Wallet },
   ];
 
   return (
@@ -538,7 +636,10 @@ function AppShell({ userEmail, onSignOut }) {
                   />
                 )}
                 {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} />}
-                {tab === "revenue" && <RevenueTab bookings={bookings} properties={properties} />}
+                {tab === "revenue" && <RevenueTab bookings={bookings} properties={properties} expenses={expenses} />}
+                {tab === "expenses" && (
+                  <ExpensesTab expenses={expenses} properties={properties} persistExpenses={persistExpenses} userEmail={userEmail} />
+                )}
               </>
             )}
           </div>
@@ -1318,13 +1419,14 @@ const navBtnStyle = { background: "#fff", border: `1px solid ${LINE}`, borderRad
 
 const DIRECT_COLOR = "#3B7A9E";
 
-function RevenueTab({ bookings, properties }) {
+function RevenueTab({ bookings, properties, expenses = [] }) {
   const active = bookings.filter((b) => !b.cancelled);
   const [selectedMonthKey, setSelectedMonthKey] = useState(null);
 
   // Splits every booking's earnings across the calendar months it actually spans, proportional
   // to nights in each month — a booking running Aug 30 → Sep 3 contributes to both August and
-  // September instead of being dumped entirely into its check-in month.
+  // September instead of being dumped entirely into its check-in month. Nights are tracked the
+  // same way, so avg price/night = a month's earned revenue ÷ its actual booked nights.
   const monthly = useMemo(() => {
     const now = new Date();
     const months = [];
@@ -1333,7 +1435,7 @@ function RevenueTab({ bookings, properties }) {
       months.push({
         key: `${d.getFullYear()}-${d.getMonth()}`,
         label: d.toLocaleDateString("en-IN", { month: "short", year: "2-digit" }),
-        airbnb: 0, direct: 0, revenue: 0, items: [],
+        airbnb: 0, direct: 0, revenue: 0, nights: 0, items: [],
       });
     }
     const byKey = Object.fromEntries(months.map((m) => [m.key, m]));
@@ -1351,11 +1453,19 @@ function RevenueTab({ bookings, properties }) {
         m.airbnb += allocAirbnb;
         m.direct += allocDirect;
         m.revenue += allocAirbnb + allocDirect;
+        m.nights += nights;
         m.items.push({ booking: b, nights, totalNights, spansMultiple, allocated: allocAirbnb + allocDirect });
       });
     });
+    months.forEach((m) => {
+      m.expenses = expensesForMonthKey(expenses, m.key);
+      m.profit = m.revenue - m.expenses;
+      m.avgPerNight = m.nights > 0 ? m.revenue / m.nights : 0;
+    });
     return months;
-  }, [active]);
+  }, [active, expenses]);
+
+  const currentMonth = monthly[monthly.length - 1];
 
   const byMode = useMemo(() => {
     const map = {};
@@ -1397,6 +1507,17 @@ function RevenueTab({ bookings, properties }) {
         <StatCard label="Total revenue" value={inr(totalRevenue)} accent={MUSTARD_DEEP} />
         <StatCard label="From direct payments" value={inr(totalDirect)} sub={totalRevenue ? `${Math.round((totalDirect / totalRevenue) * 100)}% of total` : undefined} />
         <StatCard label="Airbnb fees & taxes absorbed" value={inr(totalFees)} />
+        <StatCard
+          label="Avg price/night this month"
+          value={currentMonth.nights > 0 ? inr(Math.round(currentMonth.avgPerNight)) : "—"}
+          sub={currentMonth.nights > 0 ? `across ${currentMonth.nights} booked night${currentMonth.nights === 1 ? "" : "s"}` : "no booked nights yet"}
+        />
+        <StatCard
+          label="This month's profit"
+          value={inr(Math.round(currentMonth.profit))}
+          accent={currentMonth.profit >= 0 ? "#3F6B4E" : "#B6473F"}
+          sub={`${inr(currentMonth.revenue)} revenue − ${inr(currentMonth.expenses)} expenses`}
+        />
       </div>
 
       <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
@@ -1418,6 +1539,21 @@ function RevenueTab({ bookings, properties }) {
         </ResponsiveContainer>
       </div>
 
+      <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
+        <PanelHeader>Monthly profit — revenue minus expenses (green = profit, red = loss)</PanelHeader>
+        <ResponsiveContainer width="100%" height={200}>
+          <BarChart data={monthly}>
+            <CartesianGrid strokeDasharray="3 3" stroke={LINE} vertical={false} />
+            <XAxis dataKey="label" tick={{ fontSize: 12, fill: TEXT_MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
+            <YAxis tick={{ fontSize: 11, fill: TEXT_MUTED }} axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v >= 1000 || v <= -1000 ? (v / 1000) + "k" : v}`} />
+            <Tooltip formatter={(v) => [inr(v), "Profit"]} contentStyle={{ fontSize: 13, borderRadius: 8, border: `1px solid ${LINE}` }} />
+            <Bar dataKey="profit" radius={[4, 4, 4, 4]}>
+              {monthly.map((m, i) => <Cell key={i} fill={m.profit >= 0 ? "#3F6B4E" : "#B6473F"} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
       {selectedMonth && (
         <div style={{ background: "#fff", border: `1px solid ${MUSTARD}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
@@ -1426,6 +1562,8 @@ function RevenueTab({ bookings, properties }) {
           </div>
           <div style={{ fontSize: 13, color: TEXT_MUTED, marginBottom: 12 }}>
             {inr(selectedMonth.revenue)} total — {inr(selectedMonth.airbnb)} via Airbnb, {inr(selectedMonth.direct)} direct
+            {selectedMonth.nights > 0 && <> · {inr(Math.round(selectedMonth.avgPerNight))}/night across {selectedMonth.nights} booked night{selectedMonth.nights === 1 ? "" : "s"}</>}
+            {" · "}{inr(selectedMonth.expenses)} expenses → <strong style={{ color: selectedMonth.profit >= 0 ? "#3F6B4E" : "#B6473F" }}>{inr(selectedMonth.profit)} profit</strong>
           </div>
           {selectedMonth.items.length === 0 ? <EmptyNote text="No stays overlap this month." /> : (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -1483,6 +1621,173 @@ function RevenueTab({ bookings, properties }) {
           })}
         </div>
       </div>
+    </div>
+  );
+}
+
+function ExpensesTab({ expenses, properties, persistExpenses, userEmail }) {
+  const [form, setForm] = useState(emptyExpenseForm());
+  const [showForm, setShowForm] = useState(false);
+  const [formError, setFormError] = useState("");
+  const formRef = useRef(null);
+
+  useEffect(() => {
+    if (showForm && formRef.current) formRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [showForm]);
+
+  const resetForm = () => { setForm(emptyExpenseForm()); setShowForm(false); setFormError(""); };
+  const editExpense = (e) => { setForm(e); setShowForm(true); setFormError(""); };
+  const deleteExpense = (id, name) => {
+    if (!window.confirm(`Delete the expense "${name || "this expense"}"? This can't be undone.`)) return;
+    persistExpenses(expenses.filter((e) => e.id !== id));
+  };
+
+  const submit = (ev) => {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    if (!form.name.trim()) return setFormError("Expense name is required.");
+    if (!form.amount || Number(form.amount) <= 0) return setFormError("Enter an amount greater than zero.");
+    if (form.kind === "fixed" && !form.startDate) return setFormError("Start date is required for a fixed expense.");
+    if (form.kind === "one_time" && !form.expenseDate) return setFormError("Date is required for a one-time expense.");
+    setFormError("");
+    const isNew = !form.id;
+    const record = {
+      ...form,
+      id: form.id || (Date.now() + "-" + Math.random().toString(36).slice(2)),
+      createdBy: isNew ? userEmail : form.createdBy || userEmail,
+      updatedBy: userEmail,
+    };
+    const next = form.id ? expenses.map((e) => (e.id === form.id ? record : e)) : [...expenses, record];
+    persistExpenses(next);
+    resetForm();
+  };
+
+  const currentMonthKey = monthKeyOf(todayStr());
+  const fixed = expenses.filter((e) => e.kind === "fixed").sort((a, b) => a.name.localeCompare(b.name));
+  const oneTime = expenses.filter((e) => e.kind === "one_time").sort((a, b) => (b.expenseDate || "").localeCompare(a.expenseDate || ""));
+  const activeFixedTotal = fixed.reduce((s, e) => s + (fixedExpenseAppliesToMonthKey(e, currentMonthKey) ? Number(e.amount) || 0 : 0), 0);
+  const thisMonthTotal = expensesForMonthKey(expenses, currentMonthKey);
+  const oneTimeThisMonth = oneTime.filter((e) => e.expenseDate && monthKeyOf(e.expenseDate) === currentMonthKey)
+    .reduce((s, e) => s + (Number(e.amount) || 0), 0);
+
+  return (
+    <div>
+      <SectionHeader title="Expenses" subtitle="Track fixed monthly costs and one-time expenses to see your real profit." />
+
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 24 }}>
+        <StatCard label="Fixed cost / month" value={inr(activeFixedTotal)} sub="currently active recurring expenses" />
+        <StatCard label="This month's expenses" value={inr(thisMonthTotal)} accent={MUSTARD_DEEP} sub={`fixed + ${inr(oneTimeThisMonth)} one-time`} />
+        <StatCard label="Expenses on record" value={expenses.length} />
+      </div>
+
+      <button onClick={() => { setForm(emptyExpenseForm()); setShowForm(true); setFormError(""); }} style={{
+        background: MUSTARD, color: INK, border: "none", padding: "10px 18px", borderRadius: 8,
+        fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, marginBottom: 20,
+      }}>
+        <Plus size={16} /> New expense
+      </button>
+
+      {showForm && (
+        <div ref={formRef} style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 24 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600 }}>{form.id ? "Edit expense" : "New expense"}</div>
+            <button type="button" onClick={resetForm} style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}><X size={18} /></button>
+          </div>
+          <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ display: "flex", gap: 10 }}>
+              {[["fixed", "Fixed (recurring monthly)"], ["one_time", "One-time"]].map(([val, label]) => (
+                <button key={val} type="button" onClick={() => setForm((f) => ({ ...f, kind: val }))} style={{
+                  flex: 1, padding: "10px 14px", borderRadius: 8, cursor: "pointer", fontSize: 13.5, fontWeight: 600,
+                  border: `1px solid ${form.kind === val ? MUSTARD : LINE}`,
+                  background: form.kind === val ? "#FBF0DA" : "#fff", color: INK,
+                }}>{label}</button>
+              ))}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 12 }}>
+              <Field label="Name">
+                <input style={inputStyle} value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} placeholder="e.g. WiFi, Cleaning" autoFocus />
+              </Field>
+              <Field label="Category">
+                <select style={inputStyle} value={form.category} onChange={(e) => setForm((f) => ({ ...f, category: e.target.value }))}>
+                  {EXPENSE_CATEGORIES.map((c) => <option key={c}>{c}</option>)}
+                </select>
+              </Field>
+              <Field label={form.kind === "fixed" ? "Amount / month" : "Amount"}>
+                <input type="number" style={inputStyle} value={form.amount} onChange={(e) => setForm((f) => ({ ...f, amount: e.target.value }))} placeholder="0" />
+              </Field>
+              <Field label="Property (optional)">
+                <select style={inputStyle} value={form.property} onChange={(e) => setForm((f) => ({ ...f, property: e.target.value }))}>
+                  <option value="">All properties</option>
+                  {properties.map((p) => <option key={p}>{p}</option>)}
+                </select>
+              </Field>
+              {form.kind === "fixed" ? (
+                <>
+                  <Field label="Starts">
+                    <input type="date" style={inputStyle} value={form.startDate} onChange={(e) => setForm((f) => ({ ...f, startDate: e.target.value }))} />
+                  </Field>
+                  <Field label="Ends (optional)">
+                    <input type="date" style={inputStyle} value={form.endDate} onChange={(e) => setForm((f) => ({ ...f, endDate: e.target.value }))} />
+                  </Field>
+                </>
+              ) : (
+                <Field label="Date">
+                  <input type="date" style={inputStyle} value={form.expenseDate} onChange={(e) => setForm((f) => ({ ...f, expenseDate: e.target.value }))} />
+                </Field>
+              )}
+            </div>
+            <Field label="Notes (optional)">
+              <textarea style={{ ...inputStyle, minHeight: 60, resize: "vertical" }} value={form.notes} onChange={(e) => setForm((f) => ({ ...f, notes: e.target.value }))} />
+            </Field>
+            {formError && <div style={{ color: "#B6473F", fontSize: 13 }}>{formError}</div>}
+            <div style={{ display: "flex", gap: 10 }}>
+              <button type="submit" style={{
+                background: MUSTARD, color: INK, border: "none", padding: "10px 20px", borderRadius: 8,
+                fontSize: 14, fontWeight: 600, cursor: "pointer",
+              }}>{form.id ? "Save changes" : "Add expense"}</button>
+              <button type="button" onClick={resetForm} style={{
+                background: "#fff", color: INK, border: `1px solid ${LINE}`, padding: "10px 20px", borderRadius: 8,
+                fontSize: 14, fontWeight: 600, cursor: "pointer",
+              }}>Cancel</button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      <PanelHeader>Fixed expenses (recurring monthly)</PanelHeader>
+      {fixed.length === 0 ? <EmptyNote text="No fixed expenses yet." /> : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
+          {fixed.map((e) => (
+            <ExpenseRow key={e.id} e={e} onEdit={() => editExpense(e)} onDelete={() => deleteExpense(e.id, e.name)}
+              detail={`${inr(e.amount)}/mo · from ${e.startDate}${e.endDate ? ` to ${e.endDate}` : " · ongoing"}`} />
+          ))}
+        </div>
+      )}
+
+      <PanelHeader>One-time expenses</PanelHeader>
+      {oneTime.length === 0 ? <EmptyNote text="No one-time expenses yet." /> : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {oneTime.map((e) => (
+            <ExpenseRow key={e.id} e={e} onEdit={() => editExpense(e)} onDelete={() => deleteExpense(e.id, e.name)}
+              detail={`${inr(e.amount)} · ${e.expenseDate}`} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExpenseRow({ e, onEdit, onDelete, detail }) {
+  return (
+    <div style={{
+      background: "#fff", border: `1px solid ${LINE}`, borderRadius: 8, padding: "10px 14px",
+      display: "flex", alignItems: "center", gap: 10,
+    }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 14, fontWeight: 500 }}>{e.name} <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>· {e.category}</span>{e.property && <span style={{ color: TEXT_MUTED, fontWeight: 400 }}> · {e.property}</span>}</div>
+        <div style={{ fontSize: 12.5, color: TEXT_MUTED }}>{detail}</div>
+      </div>
+      <button onClick={onEdit} style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED, padding: 6 }}><Pencil size={15} /></button>
+      <button onClick={onDelete} style={{ background: "none", border: "none", cursor: "pointer", color: "#B6473F", padding: 6 }}><Trash2 size={15} /></button>
     </div>
   );
 }
