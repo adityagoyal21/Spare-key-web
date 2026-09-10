@@ -586,6 +586,11 @@ function AppShell({ userEmail, onSignOut }) {
   const { bookings, properties, expenses, loading, error, persistBookings, persistProperties, persistExpenses } = useStorage();
   const [tab, setTab] = useState("dashboard");
   const [navOpen, setNavOpen] = useState(false);
+  // One-shot signal so the Dashboard's "Add a new property" button can jump to the Bookings tab
+  // with that form already open — BookingsTab consumes it once on mount and clears it, so a later
+  // ordinary visit to the tab (via the sidebar) doesn't auto-open it again.
+  const [bookingsIntent, setBookingsIntent] = useState(null);
+  const openAddProperty = () => { setBookingsIntent("addProperty"); setTab("bookings"); };
 
   const NAV = [
     { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -650,12 +655,14 @@ function AppShell({ userEmail, onSignOut }) {
               <div style={{ color: TEXT_MUTED, padding: 40, textAlign: "center" }}>Loading your bookings…</div>
             ) : (
               <>
-                {tab === "dashboard" && <Dashboard bookings={bookings} properties={properties} setTab={setTab} />}
+                {tab === "dashboard" && <Dashboard bookings={bookings} properties={properties} setTab={setTab} onAddProperty={openAddProperty} />}
                 {tab === "bookings" && (
                   <BookingsTab
                     bookings={bookings} properties={properties}
                     persistBookings={persistBookings} persistProperties={persistProperties}
                     userEmail={userEmail}
+                    openAddProperty={bookingsIntent === "addProperty"}
+                    onIntentConsumed={() => setBookingsIntent(null)}
                   />
                 )}
                 {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} />}
@@ -713,7 +720,7 @@ function StatCard({ label, value, sub, accent }) {
   );
 }
 
-function Dashboard({ bookings, properties, setTab }) {
+function Dashboard({ bookings, properties, setTab, onAddProperty }) {
   const active = bookings.filter((b) => !b.cancelled);
   const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
   const totalOutstanding = active.reduce((s, b) => s + (Number(b.dueAmount) || 0), 0);
@@ -788,12 +795,12 @@ function Dashboard({ bookings, properties, setTab }) {
       </div>
 
       <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
-        <button onClick={() => setTab("bookings")} style={{
+        <button onClick={onAddProperty} style={{
           background: MUSTARD, color: INK, border: "none", padding: "11px 20px",
           borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer", display: "inline-flex",
           alignItems: "center", gap: 8,
         }}>
-          <Plus size={16} /> Log a new booking
+          <Plus size={16} /> Add a new property
         </button>
         <button onClick={() => setTab("bookings")} style={{
           background: "#fff", color: INK, border: `1px solid ${LINE}`, padding: "11px 20px",
@@ -890,9 +897,10 @@ function downloadBackupCSV(bookings) {
 }
 
 
-function BookingsTab({ bookings, properties, persistBookings, persistProperties, userEmail }) {
+function BookingsTab({ bookings, properties, persistBookings, persistProperties, userEmail, openAddProperty, onIntentConsumed }) {
   const [form, setForm] = useState(emptyForm());
   const [showForm, setShowForm] = useState(false);
+  const [showAddProperty, setShowAddProperty] = useState(false);
   const [newProperty, setNewProperty] = useState("");
   const [filterProperty, setFilterProperty] = useState("All");
   const [query, setQuery] = useState("");
@@ -906,10 +914,21 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
   const [restoreError, setRestoreError] = useState("");
   const [formError, setFormError] = useState("");
   const formRef = useRef(null);
+  const addPropertyRef = useRef(null);
 
   useEffect(() => {
     if (!form.property && properties.length) setForm((f) => ({ ...f, property: properties[0] }));
   }, [properties]); // eslint-disable-line
+
+  // Consumed exactly once on mount — arriving here via the Dashboard's "Add a new property"
+  // button opens this panel immediately, without leaving a stale flag that would reopen it on a
+  // later, unrelated visit to this tab.
+  useEffect(() => {
+    if (openAddProperty) {
+      setShowAddProperty(true);
+      onIntentConsumed && onIntentConsumed();
+    }
+  }, []); // eslint-disable-line
 
   // The form renders above the bookings list — on a long list, opening it (especially for Edit,
   // triggered from a card further down) can land off-screen and look like the button did nothing.
@@ -919,7 +938,17 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     }
   }, [showForm]);
 
-  const resetForm = () => { setForm(emptyForm()); setShowForm(false); setFormError(""); };
+  useEffect(() => {
+    if (showAddProperty && addPropertyRef.current) {
+      addPropertyRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [showAddProperty]);
+
+  // Seeds property from the current list rather than leaving it "" — the <select> falls back to
+  // showing its first option whenever the controlled value doesn't match any option, so a blank
+  // property here looked selected in the UI while actually failing the "Property is required" check.
+  const blankForm = () => ({ ...emptyForm(), property: properties[0] || "" });
+  const resetForm = () => { setForm(blankForm()); setShowForm(false); setFormError(""); };
 
   const submit = (e) => {
     if (e && e.preventDefault) e.preventDefault();
@@ -956,6 +985,7 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     if (!name || properties.includes(name)) return;
     persistProperties([...properties, name]);
     setNewProperty("");
+    setShowAddProperty(false);
   };
 
   const handleFile = (e) => {
@@ -1046,7 +1076,7 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
       <SectionHeader title="Bookings" subtitle="Add, edit, and review every stay." />
 
       <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 18, alignItems: "center" }}>
-        <button onClick={() => { setForm(emptyForm()); setShowForm(true); setFormError(""); }} style={{
+        <button onClick={() => { setForm(blankForm()); setShowForm(true); setFormError(""); }} style={{
           background: MUSTARD, color: INK, border: "none", padding: "10px 18px", borderRadius: 8,
           fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8,
         }}>
@@ -1076,14 +1106,39 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
           <option>All</option>
           {properties.map((p) => <option key={p}>{p}</option>)}
         </select>
-        <div style={{ display: "flex", gap: 6, marginLeft: "auto" }}>
-          <input placeholder="Add property…" value={newProperty} onChange={(e) => setNewProperty(e.target.value)}
-            style={{ ...inputStyle, width: 140 }} />
-          <button onClick={addProperty} style={{
-            background: "#fff", border: `1px solid ${LINE}`, borderRadius: 7, padding: "0 12px", cursor: "pointer", fontSize: 13,
-          }}>Add</button>
-        </div>
+        <button onClick={() => setShowAddProperty(true)} style={{
+          background: "#fff", color: INK, border: `1px solid ${LINE}`, padding: "10px 16px", borderRadius: 8,
+          fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 8, marginLeft: "auto",
+        }}>
+          <Plus size={16} /> Add property
+        </button>
       </div>
+
+      {showAddProperty && (
+        <div ref={addPropertyRef} style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 22 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 18, fontWeight: 600 }}>Add a new property</div>
+            <button type="button" onClick={() => { setShowAddProperty(false); setNewProperty(""); }}
+              style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}>
+              <X size={18} />
+            </button>
+          </div>
+          <Field label="Property name">
+            <input style={inputStyle} value={newProperty} onChange={(e) => setNewProperty(e.target.value)}
+              placeholder="e.g. Whimsy Suite" autoFocus onKeyDown={(e) => e.key === "Enter" && addProperty()} />
+          </Field>
+          <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+            <button onClick={addProperty} disabled={!newProperty.trim()} style={{
+              background: newProperty.trim() ? MUSTARD : PAPER_DIM, color: INK, border: "none", padding: "10px 20px",
+              borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: newProperty.trim() ? "pointer" : "default",
+            }}>Add property</button>
+            <button type="button" onClick={() => { setShowAddProperty(false); setNewProperty(""); }} style={{
+              background: "#fff", color: INK, border: `1px solid ${LINE}`, padding: "10px 20px", borderRadius: 8,
+              fontSize: 14, fontWeight: 600, cursor: "pointer",
+            }}>Cancel</button>
+          </div>
+        </div>
+      )}
 
       {showImport && (
         <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 22 }}>
