@@ -149,6 +149,41 @@ function expensesForMonthKey(expenses, monthKey) {
     return sum + (exp.expenseDate && monthKeyOf(exp.expenseDate) === monthKey ? Number(exp.amount) || 0 : 0);
   }, 0);
 }
+// Whole calendar months from start through end, inclusive of both — used to cost out a fixed
+// expense's full lifetime rather than just the currently-visible 12-month chart window.
+function monthsBetweenInclusive(startDate, endDate) {
+  const s = new Date(startDate + "T00:00:00");
+  const e = new Date(endDate + "T00:00:00");
+  return Math.max(0, (e.getFullYear() - s.getFullYear()) * 12 + (e.getMonth() - s.getMonth()) + 1);
+}
+// True all-time total: every one-time expense ever logged, plus every fixed expense's amount
+// multiplied by however many months it's actually been (or will have been) active.
+function expenseAllTimeAmount(exp) {
+  if (exp.kind === "fixed") {
+    if (!exp.startDate) return 0;
+    return (Number(exp.amount) || 0) * monthsBetweenInclusive(exp.startDate, exp.endDate || todayStr());
+  }
+  return Number(exp.amount) || 0;
+}
+function totalExpensesAllTime(expenses) {
+  return expenses.reduce((sum, exp) => sum + expenseAllTimeAmount(exp), 0);
+}
+// Groups a list of {category, amount} items (or full expense records, which have both) by
+// category — used as-is for a single month's line items, and fed expenseAllTimeAmount-expanded
+// entries for an all-time view so a fixed expense counts every month it's actually been active.
+function expensesByCategory(items) {
+  const map = {};
+  items.forEach((item) => {
+    const cat = item.category || "Other";
+    map[cat] = (map[cat] || 0) + (Number(item.amount) || 0);
+  });
+  return Object.entries(map).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+}
+function expenseDetailLine(e) {
+  return e.kind === "fixed"
+    ? `${inr(e.amount)}/mo · from ${e.startDate}${e.endDate ? ` to ${e.endDate}` : " · ongoing"}`
+    : `${inr(e.amount)} · ${e.expenseDate}`;
+}
 function emptyExpenseForm() {
   return {
     id: null, kind: "one_time", name: "", category: EXPENSE_CATEGORIES[0], amount: "",
@@ -1607,9 +1642,30 @@ const navBtnStyle = { background: "#fff", border: `1px solid ${LINE}`, borderRad
 
 const DIRECT_COLOR = "#3B7A9E";
 
+// Payment-mode and property splits scoped to a single month's allocated items, mirroring the
+// all-time versions below but computed from just that month's slice of each booking.
+function monthBreakdowns(items) {
+  const byMode = {};
+  const byProperty = {};
+  items.forEach((it) => {
+    const { allocAirbnb, allocDirect, booking } = it;
+    if (allocAirbnb > 0) byMode["Airbnb Payout"] = (byMode["Airbnb Payout"] || 0) + allocAirbnb;
+    if (allocDirect > 0) {
+      const mode = booking.directMode || "UPI";
+      byMode[mode] = (byMode[mode] || 0) + allocDirect;
+    }
+    if (!byProperty[booking.property]) byProperty[booking.property] = { airbnb: 0, direct: 0 };
+    byProperty[booking.property].airbnb += allocAirbnb;
+    byProperty[booking.property].direct += allocDirect;
+  });
+  return { byMode: Object.entries(byMode).filter(([, v]) => v > 0), byProperty };
+}
+
 function RevenueTab({ bookings, properties, expenses = [] }) {
   const active = bookings.filter((b) => !b.cancelled);
+  const [view, setView] = useState("overall");
   const [selectedMonthKey, setSelectedMonthKey] = useState(null);
+  const drillInto = (key) => { setSelectedMonthKey(key); setView("monthly"); };
 
   // Splits every booking's earnings across the calendar months it actually spans, proportional
   // to nights in each month — a booking running Aug 30 → Sep 3 contributes to both August and
@@ -1642,7 +1698,7 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
         m.direct += allocDirect;
         m.revenue += allocAirbnb + allocDirect;
         m.nights += nights;
-        m.items.push({ booking: b, nights, totalNights, spansMultiple, allocated: allocAirbnb + allocDirect });
+        m.items.push({ booking: b, nights, totalNights, spansMultiple, allocated: allocAirbnb + allocDirect, allocAirbnb, allocDirect });
       });
     });
     months.forEach((m) => {
@@ -1679,83 +1735,193 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
   }, [active, properties]);
 
   const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
-  const totalDirect = active.reduce((s, b) => s + paymentBreakdown(b).direct, 0);
   const totalFees = active.reduce((s, b) => {
     const { guestPaidAirbnb, airbnbPayout } = paymentBreakdown(b);
     return s + Math.max(0, guestPaidAirbnb - airbnbPayout);
   }, 0);
+  const totalExpensesOverall = useMemo(() => totalExpensesAllTime(expenses), [expenses]);
+  const overallProfit = totalRevenue - totalExpensesOverall;
+  const totalNightsOverall = active.reduce((s, b) => s + Math.max(0, daysBetween(b.checkIn, b.checkOut)), 0);
+  const avgPricePerNightOverall = totalNightsOverall > 0 ? totalRevenue / totalNightsOverall : 0;
 
-  const selectedMonth = monthly.find((m) => m.key === selectedMonthKey);
+  const drillMonth = monthly.find((m) => m.key === selectedMonthKey) || currentMonth;
+  const { byMode: monthByMode, byProperty: monthByPropertyMode } = monthBreakdowns(drillMonth.items);
 
   return (
     <div>
-      <SectionHeader title="Revenue" subtitle="Monthly trend, payment breakdown, and drill-down across all properties." />
+      <SectionHeader title="Revenue" subtitle="Overall performance, or drill into any month." />
 
-      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
-        <StatCard label="Total revenue" value={inr(totalRevenue)} accent={MUSTARD_DEEP} />
-        <StatCard label="From direct payments" value={inr(totalDirect)} sub={totalRevenue ? `${Math.round((totalDirect / totalRevenue) * 100)}% of total` : undefined} />
-        <StatCard label="Airbnb fees & taxes absorbed" value={inr(totalFees)} />
-        <StatCard
-          label="Avg price/night this month"
-          value={currentMonth.nights > 0 ? inr(Math.round(currentMonth.avgPerNight)) : "—"}
-          sub={currentMonth.nights > 0 ? `across ${currentMonth.nights} booked night${currentMonth.nights === 1 ? "" : "s"}` : "no booked nights yet"}
-        />
-        <StatCard
-          label="This month's profit"
-          value={inr(Math.round(currentMonth.profit))}
-          accent={currentMonth.profit >= 0 ? "#3F6B4E" : "#B6473F"}
-          sub={`${inr(currentMonth.revenue)} revenue − ${inr(currentMonth.expenses)} expenses`}
-        />
+      <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+        {[["overall", "Overall"], ["monthly", "By month"]].map(([val, label]) => (
+          <button key={val} onClick={() => setView(val)} style={{
+            padding: "9px 18px", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600,
+            border: `1px solid ${view === val ? MUSTARD : LINE}`,
+            background: view === val ? "#FBF0DA" : "#fff", color: INK,
+          }}>{label}</button>
+        ))}
       </div>
 
-      <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
-        <PanelHeader>Last 12 months — tap a bar to drill in (mustard = Airbnb, blue = direct)</PanelHeader>
-        <ResponsiveContainer width="100%" height={240}>
-          <BarChart data={monthly} onClick={(e) => {
-            if (e && typeof e.activeTooltipIndex === "number") {
-              const m = monthly[e.activeTooltipIndex];
-              setSelectedMonthKey(m.key === selectedMonthKey ? null : m.key);
-            }
-          }}>
-            <CartesianGrid strokeDasharray="3 3" stroke={LINE} vertical={false} />
-            <XAxis dataKey="label" tick={{ fontSize: 12, fill: TEXT_MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
-            <YAxis tick={{ fontSize: 11, fill: TEXT_MUTED }} axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v >= 1000 ? (v / 1000) + "k" : v}`} />
-            <Tooltip formatter={(v, name) => [inr(v), name === "airbnb" ? "Airbnb" : "Direct"]} contentStyle={{ fontSize: 13, borderRadius: 8, border: `1px solid ${LINE}` }} />
-            <Bar dataKey="airbnb" stackId="rev" fill={MUSTARD} radius={[0, 0, 0, 0]} cursor="pointer" />
-            <Bar dataKey="direct" stackId="rev" fill={DIRECT_COLOR} radius={[4, 4, 0, 0]} cursor="pointer" />
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
-        <PanelHeader>Monthly profit — revenue minus expenses (green = profit, red = loss)</PanelHeader>
-        <ResponsiveContainer width="100%" height={200}>
-          <BarChart data={monthly}>
-            <CartesianGrid strokeDasharray="3 3" stroke={LINE} vertical={false} />
-            <XAxis dataKey="label" tick={{ fontSize: 12, fill: TEXT_MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
-            <YAxis tick={{ fontSize: 11, fill: TEXT_MUTED }} axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v >= 1000 || v <= -1000 ? (v / 1000) + "k" : v}`} />
-            <Tooltip formatter={(v) => [inr(v), "Profit"]} contentStyle={{ fontSize: 13, borderRadius: 8, border: `1px solid ${LINE}` }} />
-            <Bar dataKey="profit" radius={[4, 4, 4, 4]}>
-              {monthly.map((m, i) => <Cell key={i} fill={m.profit >= 0 ? "#3F6B4E" : "#B6473F"} />)}
-            </Bar>
-          </BarChart>
-        </ResponsiveContainer>
-      </div>
-
-      {selectedMonth && (
-        <div style={{ background: "#fff", border: `1px solid ${MUSTARD}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <div style={{ fontFamily: "'Fraunces', serif", fontSize: 17, fontWeight: 600 }}>{selectedMonth.label} in detail</div>
-            <button onClick={() => setSelectedMonthKey(null)} style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}><X size={16} /></button>
+      {view === "overall" ? (
+        <>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
+            <StatCard label="Total revenue" value={inr(totalRevenue)} accent={MUSTARD_DEEP} sub="all time" />
+            <StatCard
+              label="Avg price/night"
+              value={totalNightsOverall > 0 ? inr(Math.round(avgPricePerNightOverall)) : "—"}
+              sub={totalNightsOverall > 0 ? `across ${totalNightsOverall} booked nights` : "no booked nights yet"}
+            />
+            <StatCard label="Total expenses" value={inr(Math.round(totalExpensesOverall))} sub="all time" />
+            <StatCard
+              label="Overall profit"
+              value={inr(Math.round(overallProfit))}
+              accent={overallProfit >= 0 ? "#3F6B4E" : "#B6473F"}
+              sub="revenue − expenses, all time"
+            />
+            <StatCard label="Airbnb fees & taxes absorbed" value={inr(totalFees)} />
           </div>
-          <div style={{ fontSize: 13, color: TEXT_MUTED, marginBottom: 12 }}>
-            {inr(selectedMonth.revenue)} total — {inr(selectedMonth.airbnb)} via Airbnb, {inr(selectedMonth.direct)} direct
-            {selectedMonth.nights > 0 && <> · {inr(Math.round(selectedMonth.avgPerNight))}/night across {selectedMonth.nights} booked night{selectedMonth.nights === 1 ? "" : "s"}</>}
-            {" · "}{inr(selectedMonth.expenses)} expenses → <strong style={{ color: selectedMonth.profit >= 0 ? "#3F6B4E" : "#B6473F" }}>{inr(selectedMonth.profit)} profit</strong>
+
+          <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
+            <PanelHeader>Last 12 months — revenue (mustard = Airbnb, blue = direct) — tap a bar to drill in</PanelHeader>
+            <ResponsiveContainer width="100%" height={240}>
+              <BarChart data={monthly} onClick={(e) => {
+                if (e && typeof e.activeTooltipIndex === "number") drillInto(monthly[e.activeTooltipIndex].key);
+              }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={LINE} vertical={false} />
+                <XAxis dataKey="label" tick={{ fontSize: 12, fill: TEXT_MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
+                <YAxis tick={{ fontSize: 11, fill: TEXT_MUTED }} axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v >= 1000 ? (v / 1000) + "k" : v}`} />
+                <Tooltip formatter={(v, name) => [inr(v), name === "airbnb" ? "Airbnb" : "Direct"]} contentStyle={{ fontSize: 13, borderRadius: 8, border: `1px solid ${LINE}` }} />
+                <Bar dataKey="airbnb" stackId="rev" fill={MUSTARD} radius={[0, 0, 0, 0]} cursor="pointer" />
+                <Bar dataKey="direct" stackId="rev" fill={DIRECT_COLOR} radius={[4, 4, 0, 0]} cursor="pointer" />
+              </BarChart>
+            </ResponsiveContainer>
           </div>
-          {selectedMonth.items.length === 0 ? <EmptyNote text="No stays overlap this month." /> : (
+
+          <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
+            <PanelHeader>Last 12 months — profit (green = profit, red = loss) — tap a bar to drill in</PanelHeader>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={monthly} onClick={(e) => {
+                if (e && typeof e.activeTooltipIndex === "number") drillInto(monthly[e.activeTooltipIndex].key);
+              }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={LINE} vertical={false} />
+                <XAxis dataKey="label" tick={{ fontSize: 12, fill: TEXT_MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
+                <YAxis tick={{ fontSize: 11, fill: TEXT_MUTED }} axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v >= 1000 || v <= -1000 ? (v / 1000) + "k" : v}`} />
+                <Tooltip formatter={(v) => [inr(v), "Profit"]} contentStyle={{ fontSize: 13, borderRadius: 8, border: `1px solid ${LINE}` }} />
+                <Bar dataKey="profit" radius={[4, 4, 4, 4]} cursor="pointer">
+                  {monthly.map((m, i) => <Cell key={i} fill={m.profit >= 0 ? "#3F6B4E" : "#B6473F"} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
+            <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
+              <PanelHeader>By payment mode (all time)</PanelHeader>
+              {byMode.length === 0 ? <EmptyNote text="No payments recorded yet." /> : byMode.map(([mode, val]) => (
+                <div key={mode} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                  <span>{mode}</span>
+                  <span style={{ fontWeight: 500 }}>{inr(val)} <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>({Math.round((val / totalRevenue) * 100) || 0}%)</span></span>
+                </div>
+              ))}
+              {totalFees > 0 && (
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "9px 0 0", color: "#B6473F" }}>
+                  <span>Airbnb fees & taxes absorbed</span>
+                  <span style={{ fontWeight: 500 }}>−{inr(totalFees)}</span>
+                </div>
+              )}
+            </div>
+            <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
+              <PanelHeader>By property (all time)</PanelHeader>
+              {properties.map((p) => {
+                const { airbnb, direct } = byPropertyMode[p] || { airbnb: 0, direct: 0 };
+                const val = airbnb + direct;
+                return (
+                  <div key={p} style={{ padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5 }}>
+                      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", background: propertyColor(properties, p) }} />{p}
+                      </span>
+                      <span style={{ fontWeight: 500 }}>{inr(val)}</span>
+                    </div>
+                    {val > 0 && (
+                      <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 2, marginLeft: 16 }}>
+                        {inr(airbnb)} Airbnb · {inr(direct)} direct
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+            <PanelHeader>Month</PanelHeader>
+            <select value={drillMonth.key} onChange={(e) => setSelectedMonthKey(e.target.value)} style={{ ...inputStyle, width: 160 }}>
+              {monthly.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+            </select>
+          </div>
+
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
+            <StatCard
+              label="Revenue"
+              value={inr(Math.round(drillMonth.revenue))}
+              accent={MUSTARD_DEEP}
+              sub={`${inr(Math.round(drillMonth.airbnb))} Airbnb · ${inr(Math.round(drillMonth.direct))} direct`}
+            />
+            <StatCard
+              label="Avg price/night"
+              value={drillMonth.nights > 0 ? inr(Math.round(drillMonth.avgPerNight)) : "—"}
+              sub={drillMonth.nights > 0 ? `across ${drillMonth.nights} booked night${drillMonth.nights === 1 ? "" : "s"}` : "no booked nights"}
+            />
+            <StatCard label="Expenses" value={inr(Math.round(drillMonth.expenses))} />
+            <StatCard
+              label="Profit"
+              value={inr(Math.round(drillMonth.profit))}
+              accent={drillMonth.profit >= 0 ? "#3F6B4E" : "#B6473F"}
+              sub={`${inr(Math.round(drillMonth.revenue))} revenue − ${inr(Math.round(drillMonth.expenses))} expenses`}
+            />
+          </div>
+
+          <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 20 }}>
+            <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
+              <PanelHeader>By payment mode this month</PanelHeader>
+              {monthByMode.length === 0 ? <EmptyNote text="No payments this month." /> : monthByMode.map(([mode, val]) => (
+                <div key={mode} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                  <span>{mode}</span>
+                  <span style={{ fontWeight: 500 }}>{inr(Math.round(val))}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
+              <PanelHeader>By property this month</PanelHeader>
+              {properties.filter((p) => (monthByPropertyMode[p]?.airbnb || 0) + (monthByPropertyMode[p]?.direct || 0) > 0).length === 0 ? (
+                <EmptyNote text="No stays this month." />
+              ) : properties.map((p) => {
+                const { airbnb, direct } = monthByPropertyMode[p] || { airbnb: 0, direct: 0 };
+                const val = airbnb + direct;
+                if (val === 0) return null;
+                return (
+                  <div key={p} style={{ padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5 }}>
+                      <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", background: propertyColor(properties, p) }} />{p}
+                      </span>
+                      <span style={{ fontWeight: 500 }}>{inr(Math.round(val))}</span>
+                    </div>
+                    <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 2, marginLeft: 16 }}>
+                      {inr(Math.round(airbnb))} Airbnb · {inr(Math.round(direct))} direct
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <PanelHeader>{drillMonth.label} bookings</PanelHeader>
+          {drillMonth.items.length === 0 ? <EmptyNote text="No stays overlap this month." /> : (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {selectedMonth.items.map((it, i) => (
+              {drillMonth.items.map((it, i) => (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
                   <span>
                     <strong>{it.booking.guest}</strong> · {it.booking.property}
@@ -1767,48 +1933,8 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
               ))}
             </div>
           )}
-        </div>
+        </>
       )}
-
-      <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
-        <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
-          <PanelHeader>By payment mode</PanelHeader>
-          {byMode.length === 0 ? <EmptyNote text="No payments recorded yet." /> : byMode.map(([mode, val]) => (
-            <div key={mode} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
-              <span>{mode}</span>
-              <span style={{ fontWeight: 500 }}>{inr(val)} <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>({Math.round((val / totalRevenue) * 100) || 0}%)</span></span>
-            </div>
-          ))}
-          {totalFees > 0 && (
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "9px 0 0", color: "#B6473F" }}>
-              <span>Airbnb fees & taxes absorbed</span>
-              <span style={{ fontWeight: 500 }}>−{inr(totalFees)}</span>
-            </div>
-          )}
-        </div>
-        <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
-          <PanelHeader>By property (Airbnb vs. direct)</PanelHeader>
-          {properties.map((p) => {
-            const { airbnb, direct } = byPropertyMode[p] || { airbnb: 0, direct: 0 };
-            const val = airbnb + direct;
-            return (
-              <div key={p} style={{ padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
-                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5 }}>
-                  <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: propertyColor(properties, p) }} />{p}
-                  </span>
-                  <span style={{ fontWeight: 500 }}>{inr(val)}</span>
-                </div>
-                {val > 0 && (
-                  <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 2, marginLeft: 16 }}>
-                    {inr(airbnb)} Airbnb · {inr(direct)} direct
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </div>
     </div>
   );
 }
@@ -1817,6 +1943,8 @@ function ExpensesTab({ expenses, properties, persistExpenses, userEmail, showToa
   const [form, setForm] = useState(emptyExpenseForm());
   const [showForm, setShowForm] = useState(false);
   const [formError, setFormError] = useState("");
+  const [view, setView] = useState("overall");
+  const [selectedMonthKey, setSelectedMonthKey] = useState(null);
   const formRef = useRef(null);
 
   useEffect(() => {
@@ -1855,19 +1983,46 @@ function ExpensesTab({ expenses, properties, persistExpenses, userEmail, showToa
   const fixed = expenses.filter((e) => e.kind === "fixed").sort((a, b) => a.name.localeCompare(b.name));
   const oneTime = expenses.filter((e) => e.kind === "one_time").sort((a, b) => (b.expenseDate || "").localeCompare(a.expenseDate || ""));
   const activeFixedTotal = fixed.reduce((s, e) => s + (fixedExpenseAppliesToMonthKey(e, currentMonthKey) ? Number(e.amount) || 0 : 0), 0);
-  const thisMonthTotal = expensesForMonthKey(expenses, currentMonthKey);
-  const oneTimeThisMonth = oneTime.filter((e) => e.expenseDate && monthKeyOf(e.expenseDate) === currentMonthKey)
-    .reduce((s, e) => s + (Number(e.amount) || 0), 0);
+
+  // Last 12 months of totals + the line items applicable to each, driving both the overall trend
+  // chart and the "by month" drill-down below.
+  const monthlyExpenses = useMemo(() => {
+    const now = new Date();
+    const months = [];
+    for (let i = 11; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      months.push({
+        key: `${d.getFullYear()}-${d.getMonth()}`,
+        label: d.toLocaleDateString("en-IN", { month: "short", year: "2-digit" }),
+        total: 0, items: [],
+      });
+    }
+    months.forEach((m) => {
+      expenses.forEach((exp) => {
+        if (exp.kind === "fixed") {
+          if (fixedExpenseAppliesToMonthKey(exp, m.key)) { m.total += Number(exp.amount) || 0; m.items.push(exp); }
+        } else if (exp.expenseDate && monthKeyOf(exp.expenseDate) === m.key) {
+          m.total += Number(exp.amount) || 0; m.items.push(exp);
+        }
+      });
+    });
+    return months;
+  }, [expenses]);
+
+  const currentMonthExpenses = monthlyExpenses[monthlyExpenses.length - 1];
+  const drillInto = (key) => { setSelectedMonthKey(key); setView("monthly"); };
+  const drillMonth = monthlyExpenses.find((m) => m.key === selectedMonthKey) || currentMonthExpenses;
+  const drillMonthByCategory = expensesByCategory(drillMonth.items);
+
+  const totalAllTime = useMemo(() => totalExpensesAllTime(expenses), [expenses]);
+  const categoryAllTime = useMemo(
+    () => expensesByCategory(expenses.map((e) => ({ category: e.category, amount: expenseAllTimeAmount(e) }))),
+    [expenses]
+  );
 
   return (
     <div>
       <SectionHeader title="Expenses" subtitle="Track fixed monthly costs and one-time expenses to see your real profit." />
-
-      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 24 }}>
-        <StatCard label="Fixed cost / month" value={inr(activeFixedTotal)} sub="currently active recurring expenses" />
-        <StatCard label="This month's expenses" value={inr(thisMonthTotal)} accent={MUSTARD_DEEP} sub={`fixed + ${inr(oneTimeThisMonth)} one-time`} />
-        <StatCard label="Expenses on record" value={expenses.length} />
-      </div>
 
       <button onClick={() => { setForm(emptyExpenseForm()); setShowForm(true); setFormError(""); }} style={{
         background: MUSTARD, color: INK, border: "none", padding: "10px 18px", borderRadius: 8,
@@ -1943,24 +2098,100 @@ function ExpensesTab({ expenses, properties, persistExpenses, userEmail, showToa
         </div>
       )}
 
-      <PanelHeader>Fixed expenses (recurring monthly)</PanelHeader>
-      {fixed.length === 0 ? <EmptyNote text="No fixed expenses yet." /> : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
-          {fixed.map((e) => (
-            <ExpenseRow key={e.id} e={e} onEdit={() => editExpense(e)} onDelete={() => deleteExpense(e.id, e.name)}
-              detail={`${inr(e.amount)}/mo · from ${e.startDate}${e.endDate ? ` to ${e.endDate}` : " · ongoing"}`} />
-          ))}
-        </div>
-      )}
+      <div style={{ display: "flex", gap: 10, marginBottom: 20 }}>
+        {[["overall", "Overall"], ["monthly", "By month"]].map(([val, label]) => (
+          <button key={val} onClick={() => setView(val)} style={{
+            padding: "9px 18px", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600,
+            border: `1px solid ${view === val ? MUSTARD : LINE}`,
+            background: view === val ? "#FBF0DA" : "#fff", color: INK,
+          }}>{label}</button>
+        ))}
+      </div>
 
-      <PanelHeader>One-time expenses</PanelHeader>
-      {oneTime.length === 0 ? <EmptyNote text="No one-time expenses yet." /> : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {oneTime.map((e) => (
-            <ExpenseRow key={e.id} e={e} onEdit={() => editExpense(e)} onDelete={() => deleteExpense(e.id, e.name)}
-              detail={`${inr(e.amount)} · ${e.expenseDate}`} />
-          ))}
-        </div>
+      {view === "overall" ? (
+        <>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
+            <StatCard label="Fixed cost / month" value={inr(activeFixedTotal)} sub="currently active recurring expenses" />
+            <StatCard label="Total expenses" value={inr(Math.round(totalAllTime))} accent={MUSTARD_DEEP} sub="all time" />
+            <StatCard label="Expenses on record" value={expenses.length} />
+          </div>
+
+          <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 20 }}>
+            <PanelHeader>Last 12 months — total expenses — tap a bar to drill in</PanelHeader>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={monthlyExpenses} onClick={(e) => {
+                if (e && typeof e.activeTooltipIndex === "number") drillInto(monthlyExpenses[e.activeTooltipIndex].key);
+              }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={LINE} vertical={false} />
+                <XAxis dataKey="label" tick={{ fontSize: 12, fill: TEXT_MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
+                <YAxis tick={{ fontSize: 11, fill: TEXT_MUTED }} axisLine={false} tickLine={false} tickFormatter={(v) => `₹${v >= 1000 ? (v / 1000) + "k" : v}`} />
+                <Tooltip formatter={(v) => [inr(v), "Expenses"]} contentStyle={{ fontSize: 13, borderRadius: 8, border: `1px solid ${LINE}` }} />
+                <Bar dataKey="total" fill={MUSTARD} radius={[4, 4, 0, 0]} cursor="pointer" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 24 }}>
+            <PanelHeader>By category (all time)</PanelHeader>
+            {categoryAllTime.length === 0 ? <EmptyNote text="No expenses recorded yet." /> : categoryAllTime.map(([cat, val]) => (
+              <div key={cat} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                <span>{cat}</span>
+                <span style={{ fontWeight: 500 }}>{inr(Math.round(val))} <span style={{ color: TEXT_MUTED, fontWeight: 400 }}>({Math.round((val / totalAllTime) * 100) || 0}%)</span></span>
+              </div>
+            ))}
+          </div>
+
+          <PanelHeader>Fixed expenses (recurring monthly)</PanelHeader>
+          {fixed.length === 0 ? <EmptyNote text="No fixed expenses yet." /> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 24 }}>
+              {fixed.map((e) => (
+                <ExpenseRow key={e.id} e={e} onEdit={() => editExpense(e)} onDelete={() => deleteExpense(e.id, e.name)} detail={expenseDetailLine(e)} />
+              ))}
+            </div>
+          )}
+
+          <PanelHeader>One-time expenses</PanelHeader>
+          {oneTime.length === 0 ? <EmptyNote text="No one-time expenses yet." /> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {oneTime.map((e) => (
+                <ExpenseRow key={e.id} e={e} onEdit={() => editExpense(e)} onDelete={() => deleteExpense(e.id, e.name)} detail={expenseDetailLine(e)} />
+              ))}
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
+            <PanelHeader>Month</PanelHeader>
+            <select value={drillMonth.key} onChange={(e) => setSelectedMonthKey(e.target.value)} style={{ ...inputStyle, width: 160 }}>
+              {monthlyExpenses.map((m) => <option key={m.key} value={m.key}>{m.label}</option>)}
+            </select>
+          </div>
+
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 20 }}>
+            <StatCard label="Total expenses" value={inr(Math.round(drillMonth.total))} accent={MUSTARD_DEEP} />
+            <StatCard label="Line items" value={drillMonth.items.length} />
+          </div>
+
+          <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20, marginBottom: 24 }}>
+            <PanelHeader>By category this month</PanelHeader>
+            {drillMonthByCategory.length === 0 ? <EmptyNote text="No expenses this month." /> : drillMonthByCategory.map(([cat, val]) => (
+              <div key={cat} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "7px 0", borderBottom: `1px solid ${PAPER_DIM}` }}>
+                <span>{cat}</span>
+                <span style={{ fontWeight: 500 }}>{inr(Math.round(val))}</span>
+              </div>
+            ))}
+          </div>
+
+          <PanelHeader>{drillMonth.label} expenses</PanelHeader>
+          {drillMonth.items.length === 0 ? <EmptyNote text="No expenses this month." /> : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {drillMonth.items.map((e) => (
+                <ExpenseRow key={e.id} e={e} onEdit={() => editExpense(e)} onDelete={() => deleteExpense(e.id, e.name)} detail={expenseDetailLine(e)} />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
