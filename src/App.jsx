@@ -237,6 +237,7 @@ function parseAirbnbCSV(text, existingProperties) {
       property,
       checkIn: toISODate(row[iStart]),
       checkOut: toISODate(row[iEnd]),
+      guests: 2, // the Airbnb export carries no guest-count column, so default to a typical stay
       totalAmount: totalFromParts(guestPaidAirbnb, 0) || "",
       guestPaidAirbnb: guestPaidAirbnb || "",
       airbnbPayout: airbnbPayout || "",
@@ -484,6 +485,34 @@ function useStorage() {
   return { bookings, properties, expenses, loading, error, persistBookings, persistProperties, persistExpenses };
 }
 
+// A brief, self-dismissing confirmation banner (e.g. "Booking added successfully") — the kind of
+// feedback that reassures a user an action actually saved, without requiring a click to close.
+function useToast() {
+  const [toast, setToast] = useState(null);
+  const timeoutRef = useRef(null);
+  const showToast = useCallback((message, tone = "success") => {
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    setToast({ message, tone });
+    timeoutRef.current = setTimeout(() => setToast(null), 3000);
+  }, []);
+  useEffect(() => () => timeoutRef.current && clearTimeout(timeoutRef.current), []);
+  return { toast, showToast };
+}
+function Toast({ toast }) {
+  if (!toast) return null;
+  return (
+    <div style={{
+      position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", zIndex: 60,
+      background: toast.tone === "error" ? "#B6473F" : INK, color: "#fff", padding: "12px 20px",
+      borderRadius: 8, fontSize: 14, fontWeight: 500, boxShadow: "0 6px 20px rgba(0,0,0,0.22)",
+      display: "flex", alignItems: "center", gap: 10, maxWidth: "min(90vw, 420px)",
+    }}>
+      {toast.tone === "error" ? <X size={16} /> : <Check size={16} />}
+      {toast.message}
+    </div>
+  );
+}
+
 // Tracks the current Supabase Auth session. Staff accounts are created by the property owner
 // directly in Supabase (Authentication -> Users -> Add user) — there's no public sign-up screen
 // here, since this is an internal team tool, not a consumer product.
@@ -591,6 +620,7 @@ function AppShell({ userEmail, onSignOut }) {
   // ordinary visit to the tab (via the sidebar) doesn't auto-open it again.
   const [bookingsIntent, setBookingsIntent] = useState(null);
   const openAddProperty = () => { setBookingsIntent("addProperty"); setTab("bookings"); };
+  const { toast, showToast } = useToast();
 
   const NAV = [
     { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -663,18 +693,20 @@ function AppShell({ userEmail, onSignOut }) {
                     userEmail={userEmail}
                     openAddProperty={bookingsIntent === "addProperty"}
                     onIntentConsumed={() => setBookingsIntent(null)}
+                    showToast={showToast}
                   />
                 )}
                 {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} />}
                 {tab === "revenue" && <RevenueTab bookings={bookings} properties={properties} expenses={expenses} />}
                 {tab === "expenses" && (
-                  <ExpensesTab expenses={expenses} properties={properties} persistExpenses={persistExpenses} userEmail={userEmail} />
+                  <ExpensesTab expenses={expenses} properties={properties} persistExpenses={persistExpenses} userEmail={userEmail} showToast={showToast} />
                 )}
               </>
             )}
           </div>
         </div>
       </div>
+      <Toast toast={toast} />
     </div>
   );
 }
@@ -897,7 +929,7 @@ function downloadBackupCSV(bookings) {
 }
 
 
-function BookingsTab({ bookings, properties, persistBookings, persistProperties, userEmail, openAddProperty, onIntentConsumed }) {
+function BookingsTab({ bookings, properties, persistBookings, persistProperties, userEmail, openAddProperty, onIntentConsumed, showToast }) {
   const [form, setForm] = useState(emptyForm());
   const [showForm, setShowForm] = useState(false);
   const [showAddProperty, setShowAddProperty] = useState(false);
@@ -973,12 +1005,14 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     }
     persistBookings(next);
     resetForm();
+    showToast(isNew ? "Booking added successfully" : "Booking updated successfully");
   };
 
   const editBooking = (b) => { setForm(b); setShowForm(true); setFormError(""); };
   const deleteBooking = (id, guest) => {
     if (!window.confirm(`Delete the booking for ${guest || "this guest"}? This can't be undone.`)) return;
     persistBookings(bookings.filter((b) => b.id !== id));
+    showToast("Booking deleted");
   };
   const addProperty = () => {
     const name = newProperty.trim();
@@ -986,6 +1020,7 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     persistProperties([...properties, name]);
     setNewProperty("");
     setShowAddProperty(false);
+    showToast(`"${name}" added as a new property`);
   };
 
   const handleFile = (e) => {
@@ -1023,6 +1058,7 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     const stamped = importPreview.fresh.map((b) => ({ ...b, createdBy: userEmail, updatedBy: userEmail }));
     persistBookings([...bookings, ...stamped]);
     setShowImport(false); setImportText(""); setImportPreview(null); setImportError("");
+    showToast(`${stamped.length} booking${stamped.length === 1 ? "" : "s"} imported successfully`);
   };
 
   const handleRestoreFile = (e) => {
@@ -1064,6 +1100,7 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     const merged = bookings.map((b) => updateIds.has(b.id) ? restorePreview.toUpdate.find((u) => u.id === b.id) : b);
     persistBookings([...merged, ...restorePreview.toAdd]);
     setShowRestore(false); setRestoreText(""); setRestorePreview(null); setRestoreError("");
+    showToast("Backup restored successfully");
   };
 
   const filtered = bookings
@@ -1769,7 +1806,7 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
   );
 }
 
-function ExpensesTab({ expenses, properties, persistExpenses, userEmail }) {
+function ExpensesTab({ expenses, properties, persistExpenses, userEmail, showToast }) {
   const [form, setForm] = useState(emptyExpenseForm());
   const [showForm, setShowForm] = useState(false);
   const [formError, setFormError] = useState("");
@@ -1784,6 +1821,7 @@ function ExpensesTab({ expenses, properties, persistExpenses, userEmail }) {
   const deleteExpense = (id, name) => {
     if (!window.confirm(`Delete the expense "${name || "this expense"}"? This can't be undone.`)) return;
     persistExpenses(expenses.filter((e) => e.id !== id));
+    showToast("Expense deleted");
   };
 
   const submit = (ev) => {
@@ -1803,6 +1841,7 @@ function ExpensesTab({ expenses, properties, persistExpenses, userEmail }) {
     const next = form.id ? expenses.map((e) => (e.id === form.id ? record : e)) : [...expenses, record];
     persistExpenses(next);
     resetForm();
+    showToast(isNew ? "Expense added successfully" : "Expense updated successfully");
   };
 
   const currentMonthKey = monthKeyOf(todayStr());
