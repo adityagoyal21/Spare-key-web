@@ -24,6 +24,7 @@ create table bookings (
   airbnb_payout numeric,
   amount_direct numeric,
   direct_mode text,
+  due_amount numeric,
   source text,
   created_by text,
   updated_by text,

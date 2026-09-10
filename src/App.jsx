@@ -48,10 +48,10 @@ function paymentBreakdown(b) {
   if (b.paymentMode === "Airbnb Payout") return { guestPaidAirbnb: amt, airbnbPayout: amt, direct: 0, directMode: "UPI" };
   return { guestPaidAirbnb: 0, airbnbPayout: 0, direct: amt, directMode: b.paymentMode || "UPI" };
 }
-// What the guest has paid in total so far (drives balance-due tracking).
-function guestPaidTotal(b) {
-  const { guestPaidAirbnb, direct } = paymentBreakdown(b);
-  return guestPaidAirbnb + direct;
+// Total amount is always derived — guest paid via Airbnb plus whatever was paid directly —
+// rather than entered separately, so it can never drift out of sync with the two real figures.
+function totalFromParts(guestPaidAirbnb, amountDirect) {
+  return (Number(guestPaidAirbnb) || 0) + (Number(amountDirect) || 0);
 }
 // What actually lands in the host's pocket — Airbnb payout (post fees/taxes) plus direct payments.
 function hostEarnings(b) {
@@ -136,7 +136,7 @@ function emptyForm() {
   return {
     id: null, guest: "", phone: "", property: "", checkIn: todayStr(),
     checkOut: addDays(todayStr(), 1), guests: 1, totalAmount: "",
-    guestPaidAirbnb: "", airbnbPayout: "", amountDirect: "", directMode: "UPI",
+    guestPaidAirbnb: "", airbnbPayout: "", amountDirect: "", directMode: "UPI", dueAmount: "",
     source: "Airbnb", createdBy: "", updatedBy: "", notes: "", cancelled: false,
   };
 }
@@ -172,8 +172,8 @@ function parseCSVLine(line) {
 // every field below is looked up by name so column position doesn't matter). Only "Reservation"
 // rows carry the numbers we need; "Payout" rows (bank transfers) and "Tax Withholding for India
 // Income" rows (a minor TDS deduction, deliberately ignored here) are skipped entirely.
-// - Guest paid on Airbnb = Amount + Service fee + Airbnb remitted tax (the GST Airbnb collects
-//   from the guest and remits directly \u2014 "Gross earnings" alone omits it).
+// - Guest paid on Airbnb = Gross earnings + Airbnb remitted tax (the GST Airbnb collects from the
+//   guest and remits directly \u2014 "Gross earnings" alone omits it).
 // - Your payout = Amount, as-is (the real bank deposit is a few rupees less, after the ignored
 //   income-tax withholding, but that gap is negligible for this purpose).
 function parseAirbnbCSV(text, existingProperties) {
@@ -183,7 +183,7 @@ function parseAirbnbCSV(text, existingProperties) {
   const idx = (name) => header.indexOf(name);
   const iType = idx("Type"), iConf = idx("Confirmation Code"), iStart = idx("Start date"),
     iEnd = idx("End date"), iGuest = idx("Guest"), iListing = idx("Listing"),
-    iAmount = idx("Amount"), iServiceFee = idx("Service fee"), iTax = idx("Airbnb remitted tax");
+    iAmount = idx("Amount"), iGross = idx("Gross earnings"), iTax = idx("Airbnb remitted tax");
 
   const newProperties = [];
   const seen = new Set();
@@ -196,9 +196,9 @@ function parseAirbnbCSV(text, existingProperties) {
     seen.add(code);
 
     const amount = parseFloat(row[iAmount]) || 0;
-    const serviceFee = parseFloat(row[iServiceFee]) || 0;
+    const grossEarnings = parseFloat(row[iGross]) || 0;
     const airbnbTax = parseFloat(row[iTax]) || 0;
-    const guestPaidAirbnb = amount + serviceFee + airbnbTax;
+    const guestPaidAirbnb = grossEarnings + airbnbTax;
     const airbnbPayout = amount;
 
     const listing = row[iListing] || "";
@@ -218,7 +218,7 @@ function parseAirbnbCSV(text, existingProperties) {
       property,
       checkIn: toISODate(row[iStart]),
       checkOut: toISODate(row[iEnd]),
-      totalAmount: guestPaidAirbnb || "",
+      totalAmount: totalFromParts(guestPaidAirbnb, 0) || "",
       guestPaidAirbnb: guestPaidAirbnb || "",
       airbnbPayout: airbnbPayout || "",
       amountDirect: "",
@@ -244,7 +244,8 @@ function parseBackupCSV(text) {
     checkIn: idx("Check-in"), checkOut: idx("Check-out"), guests: idx("Guests"),
     totalAmount: idx("Total Amount"), guestPaidAirbnb: idx("Guest Paid via Airbnb"),
     airbnbPayout: idx("Your Airbnb Payout"), amountDirect: idx("Paid Directly"),
-    directMode: idx("Direct Payment Mode"), source: idx("Source"), createdBy: idx("Created By"),
+    directMode: idx("Direct Payment Mode"), dueAmount: idx("Amount Due"),
+    source: idx("Source"), createdBy: idx("Created By"),
     updatedBy: idx("Updated By"), notes: idx("Notes"), cancelled: idx("Cancelled"),
   };
   const rows = [];
@@ -264,6 +265,7 @@ function parseBackupCSV(text) {
       airbnbPayout: row[cols.airbnbPayout] || "",
       amountDirect: row[cols.amountDirect] || "",
       directMode: row[cols.directMode] || "UPI",
+      dueAmount: row[cols.dueAmount] || "",
       source: row[cols.source] || "Other",
       createdBy: row[cols.createdBy] || "",
       updatedBy: row[cols.updatedBy] || "",
@@ -295,6 +297,7 @@ function rowToBooking(r) {
     airbnbPayout: r.airbnb_payout ?? "",
     amountDirect: r.amount_direct ?? "",
     directMode: r.direct_mode || "UPI",
+    dueAmount: r.due_amount ?? "",
     source: r.source || "Airbnb",
     createdBy: r.created_by || "",
     updatedBy: r.updated_by || "",
@@ -318,6 +321,7 @@ function bookingToRow(b) {
     airbnb_payout: num(b.airbnbPayout),
     amount_direct: num(b.amountDirect),
     direct_mode: b.directMode || null,
+    due_amount: num(b.dueAmount),
     source: b.source || null,
     created_by: b.createdBy || null,
     updated_by: b.updatedBy || null,
@@ -693,7 +697,7 @@ function StatCard({ label, value, sub, accent }) {
 function Dashboard({ bookings, properties, setTab }) {
   const active = bookings.filter((b) => !b.cancelled);
   const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
-  const totalOutstanding = active.reduce((s, b) => s + Math.max(0, (Number(b.totalAmount) || 0) - guestPaidTotal(b)), 0);
+  const totalOutstanding = active.reduce((s, b) => s + (Number(b.dueAmount) || 0), 0);
   const today = todayStr();
   const in3 = addDays(today, 3);
 
@@ -837,7 +841,7 @@ function downloadBackupCSV(bookings) {
   const cols = [
     "Guest Name", "Phone", "Property", "Check-in", "Check-out", "Guests", "Total Amount",
     "Guest Paid via Airbnb", "Your Airbnb Payout", "Paid Directly", "Direct Payment Mode",
-    "Source", "Created By", "Updated By", "Notes", "Cancelled",
+    "Amount Due", "Source", "Created By", "Updated By", "Notes", "Cancelled",
   ];
   const esc = (v) => {
     const s = v === undefined || v === null ? "" : String(v);
@@ -848,7 +852,7 @@ function downloadBackupCSV(bookings) {
     return [
       b.guest, b.phone, b.property, b.checkIn, b.checkOut, b.guests, b.totalAmount,
       guestPaidAirbnb || "", airbnbPayout || "", direct || "", direct ? directMode : "",
-      b.source, b.createdBy, b.updatedBy, b.notes, b.cancelled ? "Y" : "N",
+      b.dueAmount || "", b.source, b.createdBy, b.updatedBy, b.notes, b.cancelled ? "Y" : "N",
     ].map(esc).join(",");
   });
   const csv = [cols.join(","), ...rows].join("\n");
@@ -906,6 +910,7 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     const record = {
       ...form,
       id: form.id || (Date.now() + "-" + Math.random().toString(36).slice(2)),
+      totalAmount: totalFromParts(form.guestPaidAirbnb, form.amountDirect),
       createdBy: isNew ? userEmail : form.createdBy || userEmail,
       updatedBy: userEmail,
     };
@@ -1205,7 +1210,10 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
               <input type="date" style={inputStyle} value={form.checkOut} onChange={(e) => setForm({ ...form, checkOut: e.target.value })} />
             </Field>
             <Field label="Total amount (₹)">
-              <input type="number" min="0" style={inputStyle} value={form.totalAmount} onChange={(e) => setForm({ ...form, totalAmount: e.target.value })} />
+              <div style={{ ...inputStyle, background: PAPER_DIM, color: INK, cursor: "default" }}>
+                {inr(totalFromParts(form.guestPaidAirbnb, form.amountDirect))}
+              </div>
+              <div style={{ fontSize: 11, color: TEXT_MUTED }}>Auto-calculated: guest paid via Airbnb + paid directly.</div>
             </Field>
             <Field label="Guest paid via Airbnb (₹)">
               <input type="number" min="0" style={inputStyle} value={form.guestPaidAirbnb}
@@ -1226,6 +1234,10 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
             </Field>
             <Field label="Paid directly (₹)">
               <input type="number" min="0" style={inputStyle} value={form.amountDirect} onChange={(e) => setForm({ ...form, amountDirect: e.target.value })} />
+            </Field>
+            <Field label="Amount due from guest (₹)">
+              <input type="number" min="0" style={inputStyle} value={form.dueAmount} onChange={(e) => setForm({ ...form, dueAmount: e.target.value })} placeholder="0" />
+              <div style={{ fontSize: 11, color: TEXT_MUTED }}>Set this manually if the guest still owes a balance.</div>
             </Field>
             <Field label="Direct payment mode">
               <select style={inputStyle} value={form.directMode} onChange={(e) => setForm({ ...form, directMode: e.target.value })}>
@@ -1278,7 +1290,7 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
         {filtered.map((b) => {
           const { guestPaidAirbnb, airbnbPayout, direct, directMode } = paymentBreakdown(b);
           const earned = airbnbPayout + direct;
-          const balance = (Number(b.totalAmount) || 0) - guestPaidTotal(b);
+          const balance = Number(b.dueAmount) || 0;
           const parts = [];
           if (guestPaidAirbnb > 0) parts.push(`${inr(guestPaidAirbnb)} via Airbnb (you got ${inr(airbnbPayout)})`);
           if (direct > 0) parts.push(`${inr(direct)} via ${directMode}`);
