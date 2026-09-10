@@ -76,6 +76,25 @@ function addDays(dateStr, n) {
   d.setDate(d.getDate() + n);
   return ymdToISO(d.getFullYear(), d.getMonth(), d.getDate());
 }
+// The current moment in IST (UTC+5:30), regardless of the viewer's own device timezone — the
+// Dashboard's "next checkout" needs to agree on the same clock whether staff are checking it
+// from the property or from elsewhere.
+// Date.now() is an absolute instant (not affected by the device's own timezone), so shifting it
+// by IST's fixed +5:30 offset and reading it back with the UTC getters — never the local
+// getFullYear()/getHours(), which would re-apply the device's own offset on top — gives IST wall
+// time correctly no matter what timezone the viewer's device is set to.
+function nowIST() {
+  return new Date(Date.now() + 5.5 * 60 * 60000);
+}
+function todayStrIST() {
+  const d = nowIST();
+  return ymdToISO(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+// Guests are expected out by noon — once past that, treat today's checkout as already having
+// happened rather than "upcoming", so the Dashboard doesn't keep pointing at a guest who's left.
+function isPastCheckoutTimeIST() {
+  return nowIST().getUTCHours() >= 12;
+}
 function daysBetween(a, b) {
   return Math.round((new Date(b) - new Date(a)) / 86400000);
 }
@@ -698,15 +717,17 @@ function Dashboard({ bookings, properties, setTab }) {
   const active = bookings.filter((b) => !b.cancelled);
   const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
   const totalOutstanding = active.reduce((s, b) => s + (Number(b.dueAmount) || 0), 0);
-  const today = todayStr();
-  const in3 = addDays(today, 3);
+  const today = todayStrIST();
+  // Once past noon IST, today's checkout is treated as already done, so "next" skips ahead to
+  // whatever's actually still upcoming instead of pointing at a guest who's already left.
+  const checkoutFloor = isPastCheckoutTimeIST() ? addDays(today, 1) : today;
 
-  const checkoutsSoon = active
-    .filter((b) => b.checkOut >= today && b.checkOut <= in3)
-    .sort((a, b) => a.checkOut.localeCompare(b.checkOut));
-  const checkinsSoon = active
-    .filter((b) => b.checkIn >= today && b.checkIn <= in3)
-    .sort((a, b) => a.checkIn.localeCompare(b.checkIn));
+  const nextCheckout = active
+    .filter((b) => b.checkOut >= checkoutFloor)
+    .sort((a, b) => a.checkOut.localeCompare(b.checkOut))[0] || null;
+  const nextCheckin = active
+    .filter((b) => b.checkIn >= today)
+    .sort((a, b) => a.checkIn.localeCompare(b.checkIn))[0] || null;
 
   const byProperty = properties.map((p) => ({
     property: p,
@@ -731,27 +752,19 @@ function Dashboard({ bookings, properties, setTab }) {
 
       <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
         <div style={{ flex: "1 1 320px" }}>
-          <PanelHeader>Checking out in the next 3 days</PanelHeader>
-          {checkoutsSoon.length === 0 ? (
-            <EmptyNote text="No checkouts due in the next 3 days." />
+          <PanelHeader>Next checkout</PanelHeader>
+          {nextCheckout ? (
+            <GuestRow b={nextCheckout} dateField="checkOut" properties={properties} />
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {checkoutsSoon.map((b) => (
-                <GuestRow key={b.id} b={b} dateField="checkOut" properties={properties} />
-              ))}
-            </div>
+            <EmptyNote text="No upcoming checkouts on record." />
           )}
         </div>
         <div style={{ flex: "1 1 320px" }}>
-          <PanelHeader>Checking in in the next 3 days</PanelHeader>
-          {checkinsSoon.length === 0 ? (
-            <EmptyNote text="No check-ins due in the next 3 days." />
+          <PanelHeader>Next check-in</PanelHeader>
+          {nextCheckin ? (
+            <GuestRow b={nextCheckin} dateField="checkIn" properties={properties} />
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {checkinsSoon.map((b) => (
-                <GuestRow key={b.id} b={b} dateField="checkIn" properties={properties} />
-              ))}
-            </div>
+            <EmptyNote text="No upcoming check-ins on record." />
           )}
         </div>
       </div>
@@ -774,13 +787,22 @@ function Dashboard({ bookings, properties, setTab }) {
         </div>
       </div>
 
-      <button onClick={() => setTab("bookings")} style={{
-        marginTop: 24, background: MUSTARD, color: INK, border: "none", padding: "11px 20px",
-        borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer", display: "inline-flex",
-        alignItems: "center", gap: 8,
-      }}>
-        <Plus size={16} /> Log a new booking
-      </button>
+      <div style={{ display: "flex", gap: 10, marginTop: 24 }}>
+        <button onClick={() => setTab("bookings")} style={{
+          background: MUSTARD, color: INK, border: "none", padding: "11px 20px",
+          borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer", display: "inline-flex",
+          alignItems: "center", gap: 8,
+        }}>
+          <Plus size={16} /> Log a new booking
+        </button>
+        <button onClick={() => setTab("bookings")} style={{
+          background: "#fff", color: INK, border: `1px solid ${LINE}`, padding: "11px 20px",
+          borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer", display: "inline-flex",
+          alignItems: "center", gap: 8,
+        }}>
+          <NotebookPen size={16} /> View all bookings
+        </button>
+      </div>
     </div>
   );
 }
