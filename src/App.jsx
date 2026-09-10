@@ -60,7 +60,9 @@ function hostEarnings(b) {
 }
 function inr(n) {
   const v = Number(n) || 0;
-  return "₹" + v.toLocaleString("en-IN");
+  // Promotional bookings can carry a negative direct-payment amount (a discount applied as
+  // credit) — put the minus sign before the ₹ symbol ("-₹500") instead of after it ("₹-500").
+  return (v < 0 ? "-₹" : "₹") + Math.abs(v).toLocaleString("en-IN");
 }
 function pad2(n) { return String(n).padStart(2, "0"); }
 // Builds a YYYY-MM-DD string from local date parts — never round-trips through toISOString(),
@@ -858,7 +860,7 @@ function Dashboard({ bookings, properties, setTab, onAddProperty }) {
               <div style={{ width: 130, fontSize: 13.5, flexShrink: 0 }}>{p.property}</div>
               <div style={{ flex: 1, background: PAPER_DIM, borderRadius: 4, height: 14, position: "relative" }}>
                 <div style={{
-                  width: `${(p.revenue / maxRev) * 100}%`, background: propertyColor(properties, p.property),
+                  width: `${Math.max(0, (p.revenue / maxRev) * 100)}%`, background: propertyColor(properties, p.property),
                   height: "100%", borderRadius: 4, minWidth: p.revenue > 0 ? 4 : 0,
                 }} />
               </div>
@@ -1389,7 +1391,8 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
               <div style={{ fontSize: 11, color: TEXT_MUTED }}>Auto-estimated at 3% fee — overwrite with the real payout once Airbnb shows it.</div>
             </Field>
             <Field label="Paid directly (₹)">
-              <input type="number" min="0" style={inputStyle} value={form.amountDirect} onChange={(e) => setForm({ ...form, amountDirect: e.target.value })} />
+              <input type="number" style={inputStyle} value={form.amountDirect} onChange={(e) => setForm({ ...form, amountDirect: e.target.value })} />
+              <div style={{ fontSize: 11, color: TEXT_MUTED }}>Enter a negative amount for a promotional booking (a discount applied as credit).</div>
             </Field>
             <Field label="Amount due from guest (₹)">
               <input type="number" min="0" style={inputStyle} value={form.dueAmount} onChange={(e) => setForm({ ...form, dueAmount: e.target.value })} placeholder="0" />
@@ -1449,7 +1452,9 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
           const balance = Number(b.dueAmount) || 0;
           const parts = [];
           if (guestPaidAirbnb > 0) parts.push(`${inr(guestPaidAirbnb)} via Airbnb (you got ${inr(airbnbPayout)})`);
-          if (direct > 0) parts.push(`${inr(direct)} via ${directMode}`);
+          // !== 0, not > 0 — a promotional booking's direct amount can be negative (a discount
+          // applied as credit), and that should still show up rather than being silently dropped.
+          if (direct !== 0) parts.push(`${inr(direct)} via ${directMode}`);
           const paidLabel = parts.length ? parts.join(" + ") : "not yet paid";
           return (
             <div key={b.id} style={{
@@ -1649,8 +1654,10 @@ function monthBreakdowns(items) {
   const byProperty = {};
   items.forEach((it) => {
     const { allocAirbnb, allocDirect, booking } = it;
-    if (allocAirbnb > 0) byMode["Airbnb Payout"] = (byMode["Airbnb Payout"] || 0) + allocAirbnb;
-    if (allocDirect > 0) {
+    if (allocAirbnb !== 0) byMode["Airbnb Payout"] = (byMode["Airbnb Payout"] || 0) + allocAirbnb;
+    // A promotional booking's direct amount can be negative (a discount applied as credit), so
+    // this counts it in too rather than silently dropping it from the breakdown.
+    if (allocDirect !== 0) {
       const mode = booking.directMode || "UPI";
       byMode[mode] = (byMode[mode] || 0) + allocDirect;
     }
@@ -1658,7 +1665,7 @@ function monthBreakdowns(items) {
     byProperty[booking.property].airbnb += allocAirbnb;
     byProperty[booking.property].direct += allocDirect;
   });
-  return { byMode: Object.entries(byMode).filter(([, v]) => v > 0), byProperty };
+  return { byMode: Object.entries(byMode).filter(([, v]) => v !== 0), byProperty };
 }
 
 function RevenueTab({ bookings, properties, expenses = [] }) {
@@ -1715,10 +1722,12 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
     const map = {};
     active.forEach((b) => {
       const { airbnbPayout, direct, directMode } = paymentBreakdown(b);
-      if (airbnbPayout > 0) map["Airbnb Payout"] = (map["Airbnb Payout"] || 0) + airbnbPayout;
-      if (direct > 0) map[directMode] = (map[directMode] || 0) + direct;
+      if (airbnbPayout !== 0) map["Airbnb Payout"] = (map["Airbnb Payout"] || 0) + airbnbPayout;
+      // !== 0, not > 0 — a promotional booking's direct amount can be negative (a discount
+      // applied as credit), and that should still count instead of being silently dropped.
+      if (direct !== 0) map[directMode] = (map[directMode] || 0) + direct;
     });
-    return Object.entries(map).filter(([, v]) => v > 0);
+    return Object.entries(map).filter(([, v]) => v !== 0);
   }, [active]);
 
   const byPropertyMode = useMemo(() => {
@@ -1842,7 +1851,7 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
                       </span>
                       <span style={{ fontWeight: 500 }}>{inr(val)}</span>
                     </div>
-                    {val > 0 && (
+                    {val !== 0 && (
                       <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 2, marginLeft: 16 }}>
                         {inr(airbnb)} Airbnb · {inr(direct)} direct
                       </div>
@@ -1895,7 +1904,7 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
             </div>
             <div style={{ flex: "1 1 280px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 20 }}>
               <PanelHeader>By property this month</PanelHeader>
-              {properties.filter((p) => (monthByPropertyMode[p]?.airbnb || 0) + (monthByPropertyMode[p]?.direct || 0) > 0).length === 0 ? (
+              {properties.filter((p) => (monthByPropertyMode[p]?.airbnb || 0) + (monthByPropertyMode[p]?.direct || 0) !== 0).length === 0 ? (
                 <EmptyNote text="No stays this month." />
               ) : properties.map((p) => {
                 const { airbnb, direct } = monthByPropertyMode[p] || { airbnb: 0, direct: 0 };
