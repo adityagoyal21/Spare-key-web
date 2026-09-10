@@ -1337,6 +1337,14 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
   );
 }
 
+const CAL_VISIBLE_LANES = 3;
+const CAL_LANE_HEIGHT = 16;
+const CAL_DAY_HEADER_HEIGHT = 22;
+
+function occupiesDay(b, ds) {
+  return b.checkIn <= ds && ds < b.checkOut;
+}
+
 function CalendarTab({ bookings, properties }) {
   const [cursor, setCursor] = useState(() => { const d = new Date(); d.setDate(1); return d; });
   const [selected, setSelected] = useState(null);
@@ -1349,11 +1357,14 @@ function CalendarTab({ bookings, properties }) {
   const cells = [];
   for (let i = 0; i < startOffset; i++) cells.push(null);
   for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  while (cells.length % 7 !== 0) cells.push(null);
 
-  const bookingsForDay = (d) => {
-    const ds = ymdToISO(year, month, d);
-    return active.filter((b) => b.checkIn <= ds && ds < b.checkOut);
-  };
+  // Grouped into 7-day rows so a multi-night stay can be drawn as one continuous bar spanning
+  // its check-in through check-out-minus-one-night columns, instead of a separate chip repeated
+  // in every day cell it touches. A stay that crosses a week boundary simply becomes two bars —
+  // one per row — clipped to that row's dates.
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
 
   return (
     <div>
@@ -1372,34 +1383,78 @@ function CalendarTab({ bookings, properties }) {
         ))}
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+      <div style={{ fontSize: 11.5, color: TEXT_MUTED, display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6, paddingBottom: 4 }}>
         {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((d) => (
-          <div key={d} style={{ fontSize: 11.5, color: TEXT_MUTED, textAlign: "center", paddingBottom: 4 }}>{d}</div>
+          <div key={d} style={{ textAlign: "center" }}>{d}</div>
         ))}
-        {cells.map((d, i) => {
-          if (!d) return <div key={i} />;
-          const ds = ymdToISO(year, month, d);
-          const dayBookings = bookingsForDay(d);
-          const isToday = ds === todayStr();
-          return (
-            <div key={i} onClick={() => setSelected(ds)} style={{
-              minHeight: 64, background: "#fff", border: `1px solid ${isToday ? MUSTARD : LINE}`,
-              borderRadius: 7, padding: 6, cursor: "pointer", position: "relative",
-            }}>
-              <div style={{ fontSize: 12, fontWeight: isToday ? 700 : 500, color: isToday ? MUSTARD_DEEP : INK }}>{d}</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 4 }}>
-                {dayBookings.slice(0, 3).map((b) => (
-                  <div key={b.id} style={{
-                    background: propertyColor(properties, b.property), color: "#fff", fontSize: 9.5,
-                    borderRadius: 3, padding: "1px 4px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                  }}>{b.guest}</div>
-                ))}
-                {dayBookings.length > 3 && <div style={{ fontSize: 9.5, color: TEXT_MUTED }}>+{dayBookings.length - 3} more</div>}
-              </div>
-            </div>
-          );
-        })}
       </div>
+
+      {weeks.map((week, wi) => {
+        const colDates = week.map((d) => (d ? ymdToISO(year, month, d) : null));
+
+        // One bar per booking that touches this row, spanning every column it occupies here.
+        const bars = [];
+        active.forEach((b) => {
+          let startCol = -1, endCol = -1;
+          colDates.forEach((ds, c) => {
+            if (ds && occupiesDay(b, ds)) {
+              if (startCol === -1) startCol = c;
+              endCol = c;
+            }
+          });
+          if (startCol !== -1) bars.push({ booking: b, startCol, endCol });
+        });
+        bars.sort((a, b) => a.startCol - b.startCol || a.endCol - b.endCol);
+
+        // Greedy lane assignment (interval scheduling) so overlapping stays stack into separate
+        // rows within the week instead of colliding — the same idea as a Gantt/booking calendar.
+        const laneEnds = [];
+        bars.forEach((bar) => {
+          let lane = laneEnds.findIndex((endCol) => endCol < bar.startCol);
+          if (lane === -1) { lane = laneEnds.length; laneEnds.push(bar.endCol); }
+          else laneEnds[lane] = bar.endCol;
+          bar.lane = lane;
+        });
+        const occupantsInCol = (c) => bars.filter((bar) => bar.startCol <= c && c <= bar.endCol).length;
+        const cellHeight = CAL_DAY_HEADER_HEIGHT + CAL_VISIBLE_LANES * CAL_LANE_HEIGHT + 16;
+
+        return (
+          <div key={wi} style={{ position: "relative", marginBottom: 6 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6 }}>
+              {week.map((d, ci) => {
+                const ds = colDates[ci];
+                const isToday = ds === todayStr();
+                const overflow = ds ? Math.max(0, occupantsInCol(ci) - CAL_VISIBLE_LANES) : 0;
+                return (
+                  <div key={ci} onClick={() => ds && setSelected(ds)} style={{
+                    minHeight: cellHeight, background: d ? "#fff" : "transparent",
+                    border: d ? `1px solid ${isToday ? MUSTARD : LINE}` : "none",
+                    borderRadius: 7, padding: d ? 6 : 0, cursor: d ? "pointer" : "default", position: "relative",
+                  }}>
+                    {d && <div style={{ fontSize: 12, fontWeight: isToday ? 700 : 500, color: isToday ? MUSTARD_DEEP : INK }}>{d}</div>}
+                    {overflow > 0 && (
+                      <div style={{ position: "absolute", bottom: 4, left: 6, fontSize: 9.5, color: TEXT_MUTED }}>+{overflow} more</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{
+              position: "absolute", inset: 0, display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 6,
+              paddingTop: CAL_DAY_HEADER_HEIGHT + 6, pointerEvents: "none",
+            }}>
+              {bars.filter((bar) => bar.lane < CAL_VISIBLE_LANES).map((bar) => (
+                <div key={bar.booking.id} title={bar.booking.guest} style={{
+                  gridColumn: `${bar.startCol + 1} / ${bar.endCol + 2}`, gridRow: 1,
+                  marginTop: bar.lane * CAL_LANE_HEIGHT, height: 14, alignSelf: "start",
+                  background: propertyColor(properties, bar.booking.property), color: "#fff", fontSize: 9.5,
+                  borderRadius: 3, padding: "1px 4px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                }}>{bar.booking.guest}</div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
 
       {selected && (
         <div style={{ marginTop: 20, background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 16 }}>
