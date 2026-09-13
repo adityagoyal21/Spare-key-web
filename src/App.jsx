@@ -1786,6 +1786,13 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
   const overallProfit = totalRevenue - totalExpensesOverall;
   const totalNightsOverall = active.reduce((s, b) => s + Math.max(0, daysBetween(b.checkIn, b.checkOut)), 0);
   const avgPricePerNightOverall = totalNightsOverall > 0 ? totalRevenue / totalNightsOverall : 0;
+  // Cash actually in hand right now — unlike "Overall profit" above (which counts every booking's
+  // full earned value, Airbnb payout included even before it's actually been released), this only
+  // counts revenue that's genuinely landed (direct payments + Airbnb payouts already paid out)
+  // minus every expense logged to date.
+  const today = todayStrIST();
+  const totalCollected = active.reduce((s, b) => s + collectedEarnings(b, today), 0);
+  const bankBalance = totalCollected - totalExpensesOverall;
 
   const drillMonth = monthly.find((m) => m.key === selectedMonthKey) || currentMonth;
   const { byMode: monthByMode, byProperty: monthByPropertyMode } = monthBreakdowns(drillMonth.items);
@@ -1819,6 +1826,12 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
               value={inr(Math.round(overallProfit))}
               accent={overallProfit >= 0 ? "#3F6B4E" : "#B6473F"}
               sub="revenue − expenses, all time"
+            />
+            <StatCard
+              label="Bank balance"
+              value={inr(Math.round(bankBalance))}
+              accent={bankBalance >= 0 ? "#3F6B4E" : "#B6473F"}
+              sub="revenue already paid out − expenses"
             />
             <StatCard label="Airbnb fees & taxes absorbed" value={inr(totalFees)} />
           </div>
