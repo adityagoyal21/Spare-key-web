@@ -673,7 +673,8 @@ function AppShell({ userEmail, onSignOut }) {
   // with that form already open — BookingsTab consumes it once on mount and clears it, so a later
   // ordinary visit to the tab (via the sidebar) doesn't auto-open it again.
   const [bookingsIntent, setBookingsIntent] = useState(null);
-  const openAddProperty = () => { setBookingsIntent("addProperty"); setTab("bookings"); };
+  const openAddProperty = () => { setBookingsIntent({ type: "addProperty" }); setTab("bookings"); };
+  const openNewBookingFor = (checkIn) => { setBookingsIntent({ type: "newBooking", checkIn }); setTab("bookings"); };
   const { toast, showToast } = useToast();
 
   const NAV = [
@@ -745,12 +746,12 @@ function AppShell({ userEmail, onSignOut }) {
                     bookings={bookings} properties={properties}
                     persistBookings={persistBookings} persistProperties={persistProperties}
                     userEmail={userEmail}
-                    openAddProperty={bookingsIntent === "addProperty"}
+                    intent={bookingsIntent}
                     onIntentConsumed={() => setBookingsIntent(null)}
                     showToast={showToast}
                   />
                 )}
-                {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} />}
+                {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} onAddBooking={openNewBookingFor} />}
                 {tab === "revenue" && <RevenueTab bookings={bookings} properties={properties} expenses={expenses} />}
                 {tab === "expenses" && (
                   <ExpensesTab expenses={expenses} properties={properties} persistExpenses={persistExpenses} userEmail={userEmail} showToast={showToast} />
@@ -994,7 +995,7 @@ function downloadBackupCSV(bookings) {
 }
 
 
-function BookingsTab({ bookings, properties, persistBookings, persistProperties, userEmail, openAddProperty, onIntentConsumed, showToast }) {
+function BookingsTab({ bookings, properties, persistBookings, persistProperties, userEmail, intent, onIntentConsumed, showToast }) {
   const [form, setForm] = useState(emptyForm());
   const [showForm, setShowForm] = useState(false);
   const [showAddProperty, setShowAddProperty] = useState(false);
@@ -1018,13 +1019,16 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
   }, [properties]); // eslint-disable-line
 
   // Consumed exactly once on mount — arriving here via the Dashboard's "Add a new property"
-  // button opens this panel immediately, without leaving a stale flag that would reopen it on a
-  // later, unrelated visit to this tab.
+  // button, or the Calendar's "Add a booking" on an empty day, sets things up immediately without
+  // leaving a stale flag that would repeat the action on a later, unrelated visit to this tab.
   useEffect(() => {
-    if (openAddProperty) {
+    if (intent?.type === "addProperty") {
       setShowAddProperty(true);
-      onIntentConsumed && onIntentConsumed();
+    } else if (intent?.type === "newBooking") {
+      setForm({ ...blankForm(), checkIn: intent.checkIn, checkOut: addDays(intent.checkIn, 1) });
+      setShowForm(true);
     }
+    if (intent) onIntentConsumed && onIntentConsumed();
   }, []); // eslint-disable-line
 
   // The form renders above the bookings list — on a long list, opening it (especially for Edit,
@@ -1527,7 +1531,7 @@ function occupiesDay(b, ds) {
   return b.checkIn <= ds && ds < b.checkOut;
 }
 
-function CalendarTab({ bookings, properties }) {
+function CalendarTab({ bookings, properties, onAddBooking }) {
   const [cursor, setCursor] = useState(() => { const d = new Date(); d.setDate(1); return d; });
   const [selected, setSelected] = useState(null);
   const active = bookings.filter((b) => !b.cancelled);
@@ -1647,7 +1651,16 @@ function CalendarTab({ bookings, properties }) {
             <button onClick={() => setSelected(null)} style={{ background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED }}><X size={16} /></button>
           </div>
           {active.filter((b) => b.checkIn <= selected && selected < b.checkOut).length === 0 ? (
-            <EmptyNote text="No stays on this date." />
+            <div>
+              <EmptyNote text="No stays on this date." />
+              <button onClick={() => onAddBooking(selected)} style={{
+                marginTop: 10, background: MUSTARD, color: INK, border: "none", padding: "9px 16px",
+                borderRadius: 8, fontSize: 13.5, fontWeight: 600, cursor: "pointer", display: "inline-flex",
+                alignItems: "center", gap: 7,
+              }}>
+                <Plus size={15} /> Add a booking for this date
+              </button>
+            </div>
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               {active.filter((b) => b.checkIn <= selected && selected < b.checkOut).map((b) => (
