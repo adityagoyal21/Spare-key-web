@@ -1266,6 +1266,9 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     .filter((b) => filterProperty === "All" || b.property === filterProperty)
     .filter((b) => !query.trim() || b.guest.toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) => b.checkIn.localeCompare(a.checkIn));
+  // Airbnb only releases its payout after the guest checks in — same rule the Dashboard's
+  // collected-vs-outstanding split uses.
+  const today = todayStrIST();
 
   return (
     <div>
@@ -1571,6 +1574,8 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
           // applied as credit), and that should still show up rather than being silently dropped.
           if (direct !== 0) parts.push(`${inr(direct)} via ${directMode}`);
           const paidLabel = parts.length ? parts.join(" + ") : "not yet paid";
+          const payoutReceived = airbnbPayout > 0 && b.checkIn <= today;
+          const payoutPending = airbnbPayout > 0 && b.checkIn > today;
           return (
             <div key={b.id} style={{
               background: "#fff", border: `1px solid ${LINE}`, borderLeft: `4px solid ${propertyColor(properties, b.property)}`,
@@ -1597,7 +1602,15 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
                 </div>
                 <div style={{ textAlign: "right", flexShrink: 0 }}>
                   <div style={{ fontSize: 15, fontWeight: 600, color: MUSTARD_DEEP }}>{inr(earned)} <span style={{ fontSize: 11.5, color: TEXT_MUTED, fontWeight: 400 }}>earned</span></div>
-                  <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 1, maxWidth: 220 }}>{paidLabel}</div>
+                  {!b.cancelled && (payoutReceived || payoutPending) && (
+                    <span style={{
+                      display: "inline-block", fontSize: 10.5, fontWeight: 600, padding: "2px 8px", borderRadius: 10, marginTop: 3,
+                      background: payoutReceived ? "#E3EFE6" : "#FBF0DA", color: payoutReceived ? "#3F6B4E" : "#A66E12",
+                    }}>
+                      {payoutReceived ? "Airbnb payout received" : "Airbnb payout pending"}
+                    </span>
+                  )}
+                  <div style={{ fontSize: 11.5, color: TEXT_MUTED, marginTop: 3, maxWidth: 220 }}>{paidLabel}</div>
                   {balance > 0 && !b.cancelled && <div style={{ fontSize: 12.5, color: "#B6473F", marginTop: 2 }}>{inr(balance)} due from guest</div>}
                   <div style={{ display: "flex", gap: 8, marginTop: 8, justifyContent: "flex-end" }}>
                     <button onClick={() => editBooking(b)} style={{ background: "none", border: "none", cursor: "pointer", color: INK_SOFT }}><Pencil size={15} /></button>
