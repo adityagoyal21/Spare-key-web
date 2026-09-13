@@ -58,6 +58,18 @@ function hostEarnings(b) {
   const { airbnbPayout, direct } = paymentBreakdown(b);
   return airbnbPayout + direct;
 }
+// Airbnb releases its payout only after the guest checks in — before that date, that portion
+// hasn't actually landed yet, so the Dashboard's "collected" figure should exclude it (and its
+// "outstanding" figure should include it) until then. Direct payments are assumed already in
+// hand whenever they're recorded, regardless of check-in timing.
+function collectedEarnings(b, today) {
+  const { airbnbPayout, direct } = paymentBreakdown(b);
+  return (b.checkIn <= today ? airbnbPayout : 0) + direct;
+}
+function pendingAirbnbPayout(b, today) {
+  const { airbnbPayout } = paymentBreakdown(b);
+  return b.checkIn > today ? airbnbPayout : 0;
+}
 function inr(n) {
   const v = Number(n) || 0;
   // Promotional bookings can carry a negative direct-payment amount (a discount applied as
@@ -796,9 +808,11 @@ function StatCard({ label, value, sub, accent }) {
 
 function Dashboard({ bookings, properties, setTab, onAddProperty }) {
   const active = bookings.filter((b) => !b.cancelled);
-  const totalRevenue = active.reduce((s, b) => s + hostEarnings(b), 0);
-  const totalOutstanding = active.reduce((s, b) => s + (Number(b.dueAmount) || 0), 0);
   const today = todayStrIST();
+  const totalRevenue = active.reduce((s, b) => s + collectedEarnings(b, today), 0);
+  const pendingPayouts = active.reduce((s, b) => s + pendingAirbnbPayout(b, today), 0);
+  const dueFromGuests = active.reduce((s, b) => s + (Number(b.dueAmount) || 0), 0);
+  const totalOutstanding = dueFromGuests + pendingPayouts;
   // Once past noon/1 PM IST, today's checkout/check-in is treated as already done, so "next"
   // skips ahead to whatever's actually still upcoming instead of pointing at a guest who's
   // already left or already arrived.
@@ -814,11 +828,14 @@ function Dashboard({ bookings, properties, setTab, onAddProperty }) {
 
   const byProperty = properties.map((p) => ({
     property: p,
-    revenue: active.filter((b) => b.property === p).reduce((s, b) => s + hostEarnings(b), 0),
+    revenue: active.filter((b) => b.property === p).reduce((s, b) => s + collectedEarnings(b, today), 0),
   }));
   const maxRev = Math.max(1, ...byProperty.map((p) => p.revenue));
 
+  // Only counts fees on bookings that have actually been paid out — the fee hasn't really been
+  // deducted from anything yet for a stay that hasn't checked in.
   const airbnbFeesLost = active.reduce((s, b) => {
+    if (b.checkIn > today) return s;
     const { guestPaidAirbnb, airbnbPayout } = paymentBreakdown(b);
     return s + Math.max(0, guestPaidAirbnb - airbnbPayout);
   }, 0);
@@ -827,9 +844,13 @@ function Dashboard({ bookings, properties, setTab, onAddProperty }) {
     <div>
       <SectionHeader title="Dashboard" subtitle="Revenue and stays across every property, in one place." />
       <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 24 }}>
-        <StatCard label="Total revenue collected" value={inr(totalRevenue)} accent={MUSTARD_DEEP} sub="what you actually received" />
+        <StatCard label="Total revenue collected" value={inr(totalRevenue)} accent={MUSTARD_DEEP} sub="direct payments + Airbnb payouts already released" />
         <StatCard label="Airbnb fees & taxes" value={inr(airbnbFeesLost)} sub="difference between guest paid and your payout" />
-        <StatCard label="Outstanding balance" value={inr(totalOutstanding)} sub={totalOutstanding > 0 ? "across pending bookings" : "all settled"} />
+        <StatCard
+          label="Outstanding balance"
+          value={inr(totalOutstanding)}
+          sub={totalOutstanding > 0 ? `${inr(pendingPayouts)} pending Airbnb payout · ${inr(dueFromGuests)} due from guests` : "all settled"}
+        />
         <StatCard label="Bookings on record" value={active.length} />
       </div>
 
