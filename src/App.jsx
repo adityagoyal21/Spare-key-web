@@ -442,6 +442,7 @@ function useStorage() {
   const [bookings, setBookings] = useState([]);
   const [properties, setProperties] = useState(DEFAULT_PROPERTIES);
   const [expenses, setExpenses] = useState([]);
+  const [startingBankBalance, setStartingBankBalance] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -457,10 +458,14 @@ function useStorage() {
         const { data: eRows, error: eErr } = await supabase
           .from("expenses").select("*").order("created_at", { ascending: false });
         if (eErr) throw eErr;
+        const { data: sRows, error: sErr } = await supabase
+          .from("app_settings").select("*").eq("id", "default").limit(1);
+        if (sErr) throw sErr;
 
         setBookings((bRows || []).map(rowToBooking));
         setProperties((pRows || []).length ? pRows.map((r) => r.name) : DEFAULT_PROPERTIES);
         setExpenses((eRows || []).map(rowToExpense));
+        setStartingBankBalance((sRows || [])[0]?.starting_bank_balance ?? 0);
       } catch (e) {
         console.error(e);
         setError("Could not load saved data — check your Supabase connection.");
@@ -536,7 +541,24 @@ function useStorage() {
     }
   }, [expenses]);
 
-  return { bookings, properties, expenses, loading, error, persistBookings, persistProperties, persistExpenses };
+  const persistStartingBankBalance = useCallback(async (next) => {
+    setStartingBankBalance(next);
+    try {
+      const { error: upErr } = await supabase
+        .from("app_settings")
+        .upsert({ id: "default", starting_bank_balance: next }, { onConflict: "id" });
+      if (upErr) throw upErr;
+      setError("");
+    } catch (e) {
+      console.error(e);
+      setError("Save failed — changes may not persist. Check your Supabase connection.");
+    }
+  }, []);
+
+  return {
+    bookings, properties, expenses, startingBankBalance, loading, error,
+    persistBookings, persistProperties, persistExpenses, persistStartingBankBalance,
+  };
 }
 
 // A brief, self-dismissing confirmation banner (e.g. "Booking added successfully") — the kind of
@@ -666,7 +688,10 @@ export default function App() {
 }
 
 function AppShell({ userEmail, onSignOut }) {
-  const { bookings, properties, expenses, loading, error, persistBookings, persistProperties, persistExpenses } = useStorage();
+  const {
+    bookings, properties, expenses, startingBankBalance, loading, error,
+    persistBookings, persistProperties, persistExpenses, persistStartingBankBalance,
+  } = useStorage();
   const [tab, setTab] = useState("dashboard");
   const [navOpen, setNavOpen] = useState(false);
   // One-shot signal so the Dashboard's "Add a new property" button can jump to the Bookings tab
@@ -752,7 +777,12 @@ function AppShell({ userEmail, onSignOut }) {
                   />
                 )}
                 {tab === "calendar" && <CalendarTab bookings={bookings} properties={properties} onAddBooking={openNewBookingFor} />}
-                {tab === "revenue" && <RevenueTab bookings={bookings} properties={properties} expenses={expenses} />}
+                {tab === "revenue" && (
+                  <RevenueTab
+                    bookings={bookings} properties={properties} expenses={expenses}
+                    startingBankBalance={startingBankBalance} persistStartingBankBalance={persistStartingBankBalance}
+                  />
+                )}
                 {tab === "expenses" && (
                   <ExpensesTab expenses={expenses} properties={properties} persistExpenses={persistExpenses} userEmail={userEmail} showToast={showToast} />
                 )}
@@ -1702,7 +1732,55 @@ function monthBreakdowns(items) {
   return { byMode: Object.entries(byMode).filter(([, v]) => v !== 0), byProperty };
 }
 
-function RevenueTab({ bookings, properties, expenses = [] }) {
+// Like StatCard, but with a pencil affordance to edit the starting balance folded into the
+// figure — the one number in this tab that's manually entered rather than derived from bookings
+// and expenses (it exists to reconcile against whatever was in the account before this app
+// started tracking anything).
+function BankBalanceCard({ bankBalance, startingBankBalance, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(startingBankBalance);
+
+  useEffect(() => { setDraft(startingBankBalance); }, [startingBankBalance]);
+
+  const save = () => {
+    onSave(Number(draft) || 0);
+    setEditing(false);
+  };
+
+  return (
+    <div style={{ background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: "18px 20px", flex: 1, minWidth: 220 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginBottom: 6 }}>Bank balance</div>
+        <button onClick={() => setEditing((e) => !e)} title="Set starting balance" style={{
+          background: "none", border: "none", cursor: "pointer", color: TEXT_MUTED, padding: 0, lineHeight: 0,
+        }}>
+          <Pencil size={13} />
+        </button>
+      </div>
+      <div style={{ fontFamily: "'Fraunces', serif", fontSize: 28, fontWeight: 600, color: bankBalance >= 0 ? "#3F6B4E" : "#B6473F" }}>
+        {inr(Math.round(bankBalance))}
+      </div>
+      <div style={{ fontSize: 12.5, color: TEXT_MUTED, marginTop: 4 }}>
+        revenue paid out − expenses{startingBankBalance ? ` + ${inr(startingBankBalance)} starting balance` : ""}
+      </div>
+      {editing && (
+        <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+          <input
+            type="number" value={draft} onChange={(e) => setDraft(e.target.value)} autoFocus
+            onKeyDown={(e) => e.key === "Enter" && save()}
+            style={{ ...inputStyle, width: 110, padding: "6px 8px", fontSize: 13 }}
+          />
+          <button onClick={save} style={{
+            background: MUSTARD, color: INK, border: "none", borderRadius: 6, padding: "0 12px",
+            fontSize: 13, fontWeight: 600, cursor: "pointer",
+          }}>Save</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RevenueTab({ bookings, properties, expenses = [], startingBankBalance = 0, persistStartingBankBalance }) {
   const active = bookings.filter((b) => !b.cancelled);
   const [view, setView] = useState("overall");
   const [selectedMonthKey, setSelectedMonthKey] = useState(null);
@@ -1792,7 +1870,7 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
   // minus every expense logged to date.
   const today = todayStrIST();
   const totalCollected = active.reduce((s, b) => s + collectedEarnings(b, today), 0);
-  const bankBalance = totalCollected - totalExpensesOverall;
+  const bankBalance = startingBankBalance + totalCollected - totalExpensesOverall;
 
   const drillMonth = monthly.find((m) => m.key === selectedMonthKey) || currentMonth;
   const { byMode: monthByMode, byProperty: monthByPropertyMode } = monthBreakdowns(drillMonth.items);
@@ -1827,12 +1905,7 @@ function RevenueTab({ bookings, properties, expenses = [] }) {
               accent={overallProfit >= 0 ? "#3F6B4E" : "#B6473F"}
               sub="revenue − expenses, all time"
             />
-            <StatCard
-              label="Bank balance"
-              value={inr(Math.round(bankBalance))}
-              accent={bankBalance >= 0 ? "#3F6B4E" : "#B6473F"}
-              sub="revenue already paid out − expenses"
-            />
+            <BankBalanceCard bankBalance={bankBalance} startingBankBalance={startingBankBalance} onSave={persistStartingBankBalance} />
             <StatCard label="Airbnb fees & taxes absorbed" value={inr(totalFees)} />
           </div>
 

@@ -5,6 +5,7 @@
 drop table if exists bookings;
 drop table if exists expenses;
 drop table if exists properties;
+drop table if exists app_settings;
 
 create table properties (
   name text primary key
@@ -52,6 +53,17 @@ create table expenses (
   created_at timestamptz default now()
 );
 
+-- A single settings row (id is always 'default') for whole-app config that isn't tied to any one
+-- booking/expense — currently just the starting bank balance, entered once to reconcile the
+-- Revenue tab's "Bank balance" against whatever was actually in the account before this app
+-- started tracking anything.
+create table app_settings (
+  id text primary key default 'default',
+  starting_bank_balance numeric not null default 0,
+  updated_by text,
+  updated_at timestamptz default now()
+);
+
 -- Row Level Security is on by default once enabled. These policies make every table
 -- fully readable and writable by anyone holding your app's public "anon" key — the same
 -- fully-open, link-based access model this app has used from the start. If you later want
@@ -59,6 +71,7 @@ create table expenses (
 alter table properties enable row level security;
 alter table bookings enable row level security;
 alter table expenses enable row level security;
+alter table app_settings enable row level security;
 
 create policy "public read properties" on properties for select using (true);
 create policy "public write properties" on properties for all using (true) with check (true);
@@ -66,5 +79,8 @@ create policy "public read bookings" on bookings for select using (true);
 create policy "public write bookings" on bookings for all using (true) with check (true);
 create policy "public read expenses" on expenses for select using (true);
 create policy "public write expenses" on expenses for all using (true) with check (true);
+create policy "public read app_settings" on app_settings for select using (true);
+create policy "public write app_settings" on app_settings for all using (true) with check (true);
 
 insert into properties (name) values ('Whimsy Suite') on conflict do nothing;
+insert into app_settings (id) values ('default') on conflict do nothing;
