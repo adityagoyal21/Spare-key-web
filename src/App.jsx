@@ -458,14 +458,22 @@ function useStorage() {
         const { data: eRows, error: eErr } = await supabase
           .from("expenses").select("*").order("created_at", { ascending: false });
         if (eErr) throw eErr;
-        const { data: sRows, error: sErr } = await supabase
-          .from("app_settings").select("*").eq("id", "default").limit(1);
-        if (sErr) throw sErr;
 
         setBookings((bRows || []).map(rowToBooking));
         setProperties((pRows || []).length ? pRows.map((r) => r.name) : DEFAULT_PROPERTIES);
         setExpenses((eRows || []).map(rowToExpense));
-        setStartingBankBalance((sRows || [])[0]?.starting_bank_balance ?? 0);
+
+        // Isolated from the try/catch above on purpose — app_settings is a newer, optional table
+        // (e.g. its migration might not have been run yet), and its absence or failure shouldn't
+        // be able to cascade into bookings/properties/expenses never getting loaded.
+        try {
+          const { data: sRows, error: sErr } = await supabase
+            .from("app_settings").select("*").eq("id", "default").limit(1);
+          if (sErr) throw sErr;
+          setStartingBankBalance((sRows || [])[0]?.starting_bank_balance ?? 0);
+        } catch (settingsErr) {
+          console.error("Could not load app_settings (starting bank balance defaults to 0):", settingsErr);
+        }
       } catch (e) {
         console.error(e);
         setError("Could not load saved data — check your Supabase connection.");
