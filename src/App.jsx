@@ -58,17 +58,25 @@ function hostEarnings(b) {
   const { airbnbPayout, direct } = paymentBreakdown(b);
   return airbnbPayout + direct;
 }
-// Airbnb releases its payout only after the guest checks in — before that date, that portion
-// hasn't actually landed yet, so the Dashboard's "collected" figure should exclude it (and its
-// "outstanding" figure should include it) until then. Direct payments are assumed already in
-// hand whenever they're recorded, regardless of check-in timing.
-function collectedEarnings(b, today) {
-  const { airbnbPayout, direct } = paymentBreakdown(b);
-  return (b.checkIn <= today ? airbnbPayout : 0) + direct;
+// Airbnb actually releases its payout the day after check-in, around 6 PM IST — not on check-in
+// day itself. Before that exact moment, that portion hasn't landed yet, so the Dashboard's
+// "collected" figure should exclude it (and its "outstanding" figure should include it) until
+// then. Direct payments are assumed already in hand whenever they're recorded.
+function isAirbnbPayoutReleased(checkIn) {
+  if (!checkIn) return false;
+  const payoutDate = addDays(checkIn, 1);
+  const nowDate = todayStrIST();
+  if (nowDate > payoutDate) return true;
+  if (nowDate < payoutDate) return false;
+  return nowIST().getUTCHours() >= 18; // same day as the payout — only released once past 6 PM
 }
-function pendingAirbnbPayout(b, today) {
+function collectedEarnings(b) {
+  const { airbnbPayout, direct } = paymentBreakdown(b);
+  return (isAirbnbPayoutReleased(b.checkIn) ? airbnbPayout : 0) + direct;
+}
+function pendingAirbnbPayout(b) {
   const { airbnbPayout } = paymentBreakdown(b);
-  return b.checkIn > today ? airbnbPayout : 0;
+  return isAirbnbPayoutReleased(b.checkIn) ? 0 : airbnbPayout;
 }
 function inr(n) {
   const v = Number(n) || 0;
@@ -897,8 +905,8 @@ function BankBalanceCard({ bankBalance, startingBankBalance, onSave }) {
 function Dashboard({ bookings, properties, expenses = [], startingBankBalance = 0, persistStartingBankBalance, setTab, onAddProperty }) {
   const active = bookings.filter((b) => !b.cancelled);
   const today = todayStrIST();
-  const totalRevenue = active.reduce((s, b) => s + collectedEarnings(b, today), 0);
-  const pendingPayouts = active.reduce((s, b) => s + pendingAirbnbPayout(b, today), 0);
+  const totalRevenue = active.reduce((s, b) => s + collectedEarnings(b), 0);
+  const pendingPayouts = active.reduce((s, b) => s + pendingAirbnbPayout(b), 0);
   const dueFromGuests = active.reduce((s, b) => s + (Number(b.dueAmount) || 0), 0);
   const totalOutstanding = dueFromGuests + pendingPayouts;
   const totalExpensesOverall = useMemo(() => totalExpensesAllTime(expenses), [expenses]);
@@ -918,14 +926,14 @@ function Dashboard({ bookings, properties, expenses = [], startingBankBalance = 
 
   const byProperty = properties.map((p) => ({
     property: p,
-    revenue: active.filter((b) => b.property === p).reduce((s, b) => s + collectedEarnings(b, today), 0),
+    revenue: active.filter((b) => b.property === p).reduce((s, b) => s + collectedEarnings(b), 0),
   }));
   const maxRev = Math.max(1, ...byProperty.map((p) => p.revenue));
 
   // Only counts fees on bookings that have actually been paid out — the fee hasn't really been
-  // deducted from anything yet for a stay that hasn't checked in.
+  // deducted from anything yet for a stay whose payout hasn't landed.
   const airbnbFeesLost = active.reduce((s, b) => {
-    if (b.checkIn > today) return s;
+    if (!isAirbnbPayoutReleased(b.checkIn)) return s;
     const { guestPaidAirbnb, airbnbPayout } = paymentBreakdown(b);
     return s + Math.max(0, guestPaidAirbnb - airbnbPayout);
   }, 0);
@@ -1266,9 +1274,6 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
     .filter((b) => filterProperty === "All" || b.property === filterProperty)
     .filter((b) => !query.trim() || b.guest.toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) => b.checkIn.localeCompare(a.checkIn));
-  // Airbnb only releases its payout after the guest checks in — same rule the Dashboard's
-  // collected-vs-outstanding split uses.
-  const today = todayStrIST();
 
   return (
     <div>
@@ -1574,8 +1579,8 @@ function BookingsTab({ bookings, properties, persistBookings, persistProperties,
           // applied as credit), and that should still show up rather than being silently dropped.
           if (direct !== 0) parts.push(`${inr(direct)} via ${directMode}`);
           const paidLabel = parts.length ? parts.join(" + ") : "not yet paid";
-          const payoutReceived = airbnbPayout > 0 && b.checkIn <= today;
-          const payoutPending = airbnbPayout > 0 && b.checkIn > today;
+          const payoutReceived = airbnbPayout > 0 && isAirbnbPayoutReleased(b.checkIn);
+          const payoutPending = airbnbPayout > 0 && !isAirbnbPayoutReleased(b.checkIn);
           return (
             <div key={b.id} style={{
               background: "#fff", border: `1px solid ${LINE}`, borderLeft: `4px solid ${propertyColor(properties, b.property)}`,
